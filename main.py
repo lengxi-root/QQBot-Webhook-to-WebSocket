@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 import logging
 import uvicorn
 import json
-import orjson
 import asyncio
 from collections import deque
 
@@ -106,7 +105,7 @@ async def websocket_endpoint(websocket: WebSocket, secret: str, group: str = Non
     await websocket.accept()
     
     # 发送初始心跳
-    await websocket.send_bytes(orjson.dumps({
+    await websocket.send_bytes(json.dumps({
         "op": 10,
         "d": {"heartbeat_interval": 30000}
     }))
@@ -174,7 +173,7 @@ async def handle_ws_message(message: str, websocket: WebSocket):
     try:
         data = json.loads(message)
         if data["op"] == 2:  # 处理鉴权
-            await websocket.send_bytes(orjson.dumps({
+            await websocket.send_bytes(json.dumps({
                 "op": 0,
                 "s": 1,
                 "t": "READY",
@@ -186,7 +185,7 @@ async def handle_ws_message(message: str, websocket: WebSocket):
                 }
             }))
         elif data["op"] == 1:  # 心跳响应
-            await websocket.send_bytes(orjson.dumps({"op": 11}))
+            await websocket.send_bytes(json.dumps({"op": 11}))
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
 

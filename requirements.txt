@@ -3,6 +3,5 @@ fastapi==0.115.5
 pydantic==2.9.2
 uvicorn==0.32.0
 websockets==14.0
-orjson==3.10.3
 uvloop==0.19.0
 httptools==0.6.0
