@@ -56,10 +56,10 @@ logging.basicConfig(
 
 @app.post("/webhook")
 async def handle_webhook(
-    request: Request,
-    payload: Payload,
-    user_agent: str = Header(None),
-    x_bot_appid: str = Header(None)
+        request: Request,
+        payload: Payload,
+        user_agent: str = Header(None),
+        x_bot_appid: str = Header(None)
 ):
     secret = request.query_params.get('secret')
     body_bytes = await request.body()
@@ -102,7 +102,7 @@ async def handle_webhook(
     return {"status": "delivered"}
 
 @app.websocket("/ws/{secret}")
-async def websocket_endpoint(websocket: WebSocket, secret: str):
+async def websocket_endpoint(websocket: WebSocket, secret: str, group: str = None, member: str = None, content: str = None):
     await websocket.accept()
     
     # 发送初始心跳
@@ -111,15 +111,26 @@ async def websocket_endpoint(websocket: WebSocket, secret: str):
         "d": {"heartbeat_interval": 30000}
     }))
     
+    # 判断环境
+    is_sandbox = any([group, member, content])
+    environment = "沙盒环境" if is_sandbox else "正式环境"
+
     # 注册连接
     async with cache_lock:
         if secret not in active_connections:
             active_connections[secret] = {}
-        active_connections[secret][websocket] = 0
         
+        active_connections[secret][websocket] = {
+            "failure_count": 0,
+            "group": group,
+            "member": member,
+            "content": content,
+            "is_sandbox": is_sandbox
+        }
+
         current_count = len(active_connections[secret])
-        logging.info(f"WS连接成功 | 密钥：{secret} | 连接数：{current_count}")
         
+        logging.info(f"WS连接成功 | 密钥：{secret} | 连接数：{current_count} | 当前环境：{environment}")
         # 延迟启动缓存重发
         if secret in message_cache and len(message_cache[secret]) > 0:
             if secret in sender_tasks:
@@ -180,32 +191,68 @@ async def handle_ws_message(message: str, websocket: WebSocket):
         logging.error(f"WS消息处理错误: {e}")
 
 async def send_to_all(secret: str, data: bytes):
+    try:
+        message_json = json.loads(data.decode('utf-8'))
+    except json.JSONDecodeError:
+        logging.error(f"消息解析错误: {data}")
+        return
     async with cache_lock:
         connections = active_connections.get(secret, {})
         websockets = list(connections.keys())
     
     success_count = 0
+    sandbox_success = 0
+    formal_success = 0
     for ws in websockets:
-        try:
-            await ws.send_bytes(data)
-            success_count += 1
-            async with cache_lock:
-                connections[ws] = 0  # 重置失败计数
-        except Exception as e:
-            logging.error(f"消息转发失败 | 密钥：{secret} | 错误：{e}")
-            async with cache_lock:
-                connections[ws] += 1
-                
-                if connections[ws] >= 5:
-                    try:
-                        await ws.close()
-                    except:
-                        pass
-                    del connections[ws]
-                    logging.info(f"连续5次失败关闭连接 | 密钥：{secret}")
-    
+        filters = connections[ws]
+        group = filters.get("group")
+        member = filters.get("member")
+        content_filter = filters.get("content")
+        is_sandbox = filters.get("is_sandbox")
+
+        should_send = True
+        if is_sandbox:
+            if group:
+                should_send = message_json.get("d", {}).get("group_openid") == group
+            if should_send and member:
+                should_send = should_send and message_json.get("d", {}).get("author", {}).get("member_openid") == member
+            if should_send and content_filter:
+                content = message_json.get("d", {}).get("content")
+                should_send = should_send and (content_filter in content if content else False)
+
+        if should_send:
+            try:
+                await ws.send_bytes(data)
+                success_count += 1
+                if is_sandbox:
+                    sandbox_success += 1
+                else:
+                    formal_success += 1
+                async with cache_lock:
+                    connections[ws]["failure_count"] = 0  # 重置失败计数
+            except Exception as e:
+                logging.error(f"消息转发失败 | 密钥：{secret} | 错误：{e}")
+                async with cache_lock:
+                    connections[ws]["failure_count"] += 1
+
+                    if connections[ws]["failure_count"] >= 5:
+                        try:
+                            await ws.close()
+                        except:
+                            pass
+                        del connections[ws]
+                        logging.info(f"连续5次失败关闭连接 | 密钥：{secret}")
+
+    env_str = []
+    if sandbox_success > 0:
+        env_str.append("沙盒环境")
+    if formal_success > 0:
+        env_str.append("正式环境")
+    env_str = " | ".join(env_str)
+
     if success_count > 0:
-        logging.info(f"消息转发成功 | 密钥：{secret} | 成功数：{success_count}/{len(websockets)}")
+        logging.info(f"消息转发成功 | 密钥：{secret} | 成功数：{success_count}/{len(websockets)} | {env_str}")
+
 
 async def resend_cached_messages(secret: str):
     try:
