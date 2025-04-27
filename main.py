@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import *
 from fastapi.staticfiles import StaticFiles
@@ -8,10 +7,17 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 from datetime import datetime, timedelta
 import logging
 import uvicorn
-import json
-import orjson
 import asyncio
 from collections import deque
+
+try:
+    import orjson
+    json_module = orjson
+    JSONDecodeError = orjson.JSONDecodeError
+except ImportError:
+    import json
+    json_module = json
+    JSONDecodeError = json.JSONDecodeError
 
 app = FastAPI()
 
@@ -106,7 +112,7 @@ async def websocket_endpoint(websocket: WebSocket, secret: str, group: str = Non
     await websocket.accept()
     
     # 发送初始心跳
-    await websocket.send_bytes(orjson.dumps({
+    await websocket.send_bytes(json_module.dumps({
         "op": 10,
         "d": {"heartbeat_interval": 30000}
     }))
@@ -172,9 +178,9 @@ async def websocket_endpoint(websocket: WebSocket, secret: str, group: str = Non
 
 async def handle_ws_message(message: str, websocket: WebSocket):
     try:
-        data = json.loads(message)
+        data = json_module.loads(message)
         if data["op"] == 2:  # 处理鉴权
-            await websocket.send_bytes(orjson.dumps({
+            await websocket.send_bytes(json_module.dumps({
                 "op": 0,
                 "s": 1,
                 "t": "READY",
@@ -186,14 +192,17 @@ async def handle_ws_message(message: str, websocket: WebSocket):
                 }
             }))
         elif data["op"] == 1:  # 心跳响应
-            await websocket.send_bytes(orjson.dumps({"op": 11}))
+            await websocket.send_bytes(json_module.dumps({"op": 11}))
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
 
 async def send_to_all(secret: str, data: bytes):
     try:
-        message_json = json.loads(data.decode('utf-8'))
-    except json.JSONDecodeError:
+        if json_module is orjson:
+            message_json = json_module.loads(data)
+        else:
+            message_json = json_module.loads(data.decode('utf-8'))
+    except JSONDecodeError:
         logging.error(f"消息解析错误: {data}")
         return
     async with cache_lock:
