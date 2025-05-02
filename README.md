@@ -1,6 +1,7 @@
 # Webhook to WebSocket Bridge Service
 
 为提供QQBot的Webhook到WebSocket的实时消息转发能力，以ws将消息推送到客户端，支持消息缓存断线重传、高稳定并发等特性。
+！！仅做桥接转换，不支持转换为onebot协议连接
 
 ### 功能特性
 
@@ -51,7 +52,7 @@
 保存后，请配置【事件接收】。
 
 ###  🚀客户端连接Websocket
-WebSocket统一连接地址格式：`ws://{域名}:8000/ws/{机器人密钥}/{TOKEN}`
+WebSocket统一连接地址格式：`ws://{域名}:8000/ws/{机器人密钥}`
 
 注意:推荐开启wss连接，具体开启方法网上寻找
 
@@ -65,7 +66,6 @@ WebSocket统一连接地址格式：`ws://{域名}:8000/ws/{机器人密钥}/{TO
 - 内容：详细描述问题，包括复现步骤、期望结果、实际结果、截图、日志等。
 - 标签：请选择合适的标签，如 bug、enhancement、question 等。
 
-错误的提交 Issues 可能会被关闭，请谨慎提交。
 
 ## ✨关于 Pull Requests
 若有意向参与本项目的开发，请提交 Pull Requests。
