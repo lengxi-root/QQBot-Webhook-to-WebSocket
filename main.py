@@ -14,6 +14,8 @@ import os
 from pathlib import Path
 import re
 from urllib.parse import urlparse
+import aiohttp
+from typing import List
 
 try:
     import orjson
@@ -104,11 +106,11 @@ logger = logging.getLogger()
 def generate_signature(bot_secret, event_ts, plain_token):
     while len(bot_secret) < 32:
         bot_secret = (bot_secret + bot_secret)[:32]
-    
+
     private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bot_secret.encode())
     message = f"{event_ts}{plain_token}".encode()
     signature = private_key.sign(message).hex()
-    
+
     return {
         "plain_token": plain_token,
         "signature": signature
@@ -116,6 +118,54 @@ def generate_signature(bot_secret, event_ts, plain_token):
 
 class Payload(BaseModel):
     d: dict
+
+def load_webhook_config() -> dict:
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    return {
+        'enabled': config.getboolean('WEBHOOK_FORWARD', 'enabled', fallback=False),
+        'targets': [
+            url.strip() 
+            for url in config.get('WEBHOOK_FORWARD', 'targets', fallback='').split(',')
+            if url.strip()
+        ],
+        'timeout': config.getint('WEBHOOK_FORWARD', 'timeout', fallback=5)
+    }
+
+async def forward_webhook(
+    targets: List[str], 
+    body: bytes, 
+    headers: dict, 
+    timeout: int
+) -> list:
+    async def send_to_target(session: aiohttp.ClientSession, url: str) -> dict:
+        try:
+            async with session.post(
+                url,
+                data=body,
+                headers=headers,
+                timeout=timeout
+            ) as response:
+                return {
+                    'url': url,
+                    'status': response.status,
+                    'success': 200 <= response.status < 300
+                }
+        except Exception as e:
+            return {
+                'url': url,
+                'status': None,
+                'success': False,
+                'error': str(e)
+            }
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            send_to_target(session, target) 
+            for target in targets
+        ]
+        results = await asyncio.gather(*tasks)
+        return results
 
 @app.post("/webhook")
 async def handle_webhook(
@@ -128,7 +178,31 @@ async def handle_webhook(
     body_bytes = await request.body()
     logging.debug(f"收到原始消息: {body_bytes}")
 
-    # 处理回调验证
+    # 处理webhook转发
+    webhook_config = load_webhook_config()
+    if webhook_config['enabled'] and webhook_config['targets']:
+        # 获取原始请求头
+        forward_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ['host', 'content-length']
+        }
+        
+        # 异步转发
+        forward_results = await forward_webhook(
+            webhook_config['targets'],
+            body_bytes,
+            forward_headers,
+            webhook_config['timeout']
+        )
+        
+        # 记录转发结果
+        for result in forward_results:
+            if result['success']:
+                logging.info(f"Webhook转发成功 | URL: {result['url']} | 状态码: {result['status']}")
+            else:
+                logging.error(f"Webhook转发失败 | URL: {result['url']} | 错误: {result.get('error', '未知错误')}")
+
+    # 原有的处理逻辑
     if "event_ts" in payload.d and "plain_token" in payload.d:
         try:
             event_ts = payload.d["event_ts"]
@@ -286,7 +360,7 @@ async def handle_ws_message(message: str, websocket: WebSocket):
                     "shard": [0, 0]
                 }
             }))
-        elif data["op"] == 1:  # 心跳响应
+        elif data["op"] == 1:  # 心跳
             await websocket.send_bytes(json_module.dumps({"op": 11}))
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
