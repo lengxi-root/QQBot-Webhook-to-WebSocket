@@ -40,6 +40,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class PrivacyUtils:
+    @staticmethod
+    def sanitize_ip(ip: str) -> str:
+        """IP地址脱敏处理"""
+        if not ip or ip == "unknown":
+            return "unknown"
+        ip_parts = ip.split('.')
+        if len(ip_parts) == 4:  # IPv4地址处理
+            return f"{ip_parts[0]}.***.***.{ip_parts[3]}"
+        return ip
+
+    @staticmethod
+    def sanitize_secret(secret: str) -> str:
+        """密钥脱敏处理"""
+        if not secret:
+            return "****"
+        if len(secret) <= 6:
+            return "****"
+        return f"{secret[:3]}****{secret[-3:]}"
+
+    @staticmethod
+    def sanitize_url(url: str) -> str:
+        """URL脱敏处理"""
+        try:
+            parsed = urlparse(url)
+            # 处理域名部分
+            netloc = parsed.netloc
+            if ':' in netloc:
+                host, port = netloc.split(':')
+                host = PrivacyUtils.sanitize_ip(host)
+                netloc = f"{host}:{port}"
+            else:
+                netloc = PrivacyUtils.sanitize_ip(netloc)
+            
+            # 处理查询参数中的密钥
+            query = parsed.query
+            if query:
+                query_params = dict(param.split('=') for param in query.split('&') if '=' in param)
+                if 'secret' in query_params:
+                    query_params['secret'] = PrivacyUtils.sanitize_secret(query_params['secret'])
+                query = '&'.join(f"{k}={v}" for k, v in query_params.items())
+            
+            # 重建URL
+            sanitized = parsed._replace(netloc=netloc, query=query)
+            return sanitized.geturl()
+        except Exception as e:
+            logging.error(f"URL脱敏处理失败: {str(e)}")
+            return "***"
+
+    @staticmethod
+    def sanitize_path(path: str) -> str:
+        """URL路径脱敏处理"""
+        return re.sub(
+            r"(secret=)(\w{3})\w+",
+            r"\1\2****",
+            path,
+            flags=re.IGNORECASE
+        )
+
 # 隐私保护中间件
 @app.middleware("http")
 async def privacy_middleware(request: Request, call_next):
@@ -47,14 +106,7 @@ async def privacy_middleware(request: Request, call_next):
     
     # IP地址脱敏处理
     client_host = request.client.host if request.client else "unknown"
-    if client_host != "unknown":
-        ip_parts = client_host.split('.')
-        if len(ip_parts) == 4:  # IPv4地址处理
-            sanitized_ip = f"{ip_parts[0]}.***.***.{ip_parts[3]}"
-        else:  # 其他格式保持原样
-            sanitized_ip = client_host
-    else:
-        sanitized_ip = "unknown"
+    sanitized_ip = PrivacyUtils.sanitize_ip(client_host)
 
     # URL路径处理
     full_url = str(request.url)
@@ -64,12 +116,7 @@ async def privacy_middleware(request: Request, call_next):
         sanitized_path += "?" + parsed_url.query
     
     # 敏感参数过滤
-    sanitized_path = re.sub(
-        r"(secret=)(\w{3})\w+",
-        r"\1\2****",
-        sanitized_path,
-        flags=re.IGNORECASE
-    )
+    sanitized_path = PrivacyUtils.sanitize_path(sanitized_path)
 
     # 构建安全日志
     log_message = (
@@ -275,40 +322,69 @@ async def get_stats():
 def load_webhook_config() -> dict:
     config = configparser.ConfigParser()
     config.read('config.ini')
+    
+    # 解析目标URL和对应的密钥
+    targets_config = config.get('WEBHOOK_FORWARD', 'targets', fallback='')
+    targets = []
+    for url in targets_config.split(','):
+        url = url.strip()
+        if not url:
+            continue
+            
+        # 解析URL中的secret参数
+        parsed_url = urlparse(url)
+        query_params = dict(param.split('=') for param in parsed_url.query.split('&') if '=' in param)
+        target_secret = query_params.get('secret')
+        
+        if target_secret:
+            targets.append({
+                'url': url,
+                'secret': target_secret
+            })
+    
     return {
         'enabled': config.getboolean('WEBHOOK_FORWARD', 'enabled', fallback=False),
-        'targets': [
-            url.strip() 
-            for url in config.get('WEBHOOK_FORWARD', 'targets', fallback='').split(',')
-            if url.strip()
-        ],
+        'targets': targets,
         'timeout': config.getint('WEBHOOK_FORWARD', 'timeout', fallback=5)
     }
 
 async def forward_webhook(
-    targets: List[str], 
+    targets: List[dict], 
     body: bytes, 
     headers: dict, 
-    timeout: int
+    timeout: int,
+    current_secret: str
 ) -> list:
-    async def send_to_target(session: aiohttp.ClientSession, url: str) -> dict:
+    async def send_to_target(session: aiohttp.ClientSession, target: dict) -> dict:
+        # 只转发给匹配密钥的目标
+        if target['secret'] != current_secret:
+            return {
+                'url': target['url'],
+                'status': None,
+                'success': True,
+                'skipped': True,
+                'reason': '密钥不匹配'
+            }
+            
         try:
             async with session.post(
-                url,
+                target['url'],
                 data=body,
                 headers=headers,
                 timeout=timeout
             ) as response:
                 return {
-                    'url': url,
+                    'url': target['url'],
                     'status': response.status,
-                    'success': 200 <= response.status < 300
+                    'success': 200 <= response.status < 300,
+                    'skipped': False
                 }
         except Exception as e:
             return {
-                'url': url,
+                'url': target['url'],
                 'status': None,
                 'success': False,
+                'skipped': False,
                 'error': str(e)
             }
 
@@ -345,15 +421,19 @@ async def handle_webhook(
             webhook_config['targets'],
             body_bytes,
             forward_headers,
-            webhook_config['timeout']
+            webhook_config['timeout'],
+            secret
         )
         
         # 记录转发结果
         for result in forward_results:
-            if result['success']:
-                logging.info(f"Webhook转发成功 | URL: {result['url']} | 状态码: {result['status']}")
+            sanitized_url = PrivacyUtils.sanitize_url(result['url'])
+            if result.get('skipped', False):
+                logging.debug(f"Webhook转发跳过 | URL: {sanitized_url} | 原因: {result.get('reason', '未知')}")
+            elif result['success']:
+                logging.info(f"Webhook转发成功 | URL: {sanitized_url} | 状态码: {result['status']}")
             else:
-                logging.error(f"Webhook转发失败 | URL: {result['url']} | 错误: {result.get('error', '未知错误')}")
+                logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
 
     # 更新webhook统计
     if secret:
@@ -387,12 +467,12 @@ async def handle_webhook(
             cache["public"].popleft()
             expired_public += 1
         if expired_public > 0:
-            logging.debug(f"清理公共缓存 | 密钥：{secret[:3]}**** | 数量：{expired_public}")
+            logging.debug(f"清理公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{expired_public}")
 
         # 没有在线连接时缓存到公共
         if not has_online:
             cache["public"].append((expiry, body_bytes))
-            logging.info(f"消息存入公共缓存 | 密钥：{secret[:3]}**** | 数量：{len(cache['public'])}")
+            logging.info(f"消息存入公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{len(cache['public'])}")
 
         # 处理token缓存
         offline_tokens = []
@@ -413,10 +493,10 @@ async def handle_webhook(
                 deque_token.popleft()
                 expired += 1
             if expired > 0:
-                logging.debug(f"清理Token缓存 | 密钥：{secret[:3]}**** | Token：{token[:3]}**** | 数量：{expired}")
+                logging.debug(f"清理Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{expired}")
             
             deque_token.append((expiry, body_bytes))
-            logging.info(f"消息存入Token缓存 | 密钥：{secret[:3]}**** | Token：{token[:3]}**** | 数量：{len(deque_token)}")
+            logging.info(f"消息存入Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{len(deque_token)}")
 
     # 实时转发
     await send_to_all(secret, body_bytes)
@@ -464,10 +544,10 @@ async def websocket_endpoint(
         if token:
             message_cache.setdefault(secret, {"public": deque(maxlen=1000), "tokens": {}})
             message_cache[secret]["tokens"].setdefault(token, deque(maxlen=1000))
-            logging.debug(f"初始化Token队列 | 密钥：{secret[:3]}**** | Token：{token[:3]}****")
+            logging.debug(f"初始化Token队列 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)}")
 
     logging.info(
-        f"WS连接成功 | 密钥：{secret[:3]}**** | Token：{token[:3]+'****' if token else '无'} | "
+        f"WS连接成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token) if token else '无'} | "
         f"环境：{environment} | 连接数：{current_count}"
     )
 
@@ -496,10 +576,10 @@ async def websocket_endpoint(
                 if token:
                     message_cache.setdefault(secret, {"public": deque(maxlen=1000), "tokens": {}})
                     message_cache[secret]["tokens"].setdefault(token, deque(maxlen=1000))
-                    logging.debug(f"准备离线缓存 | 密钥：{secret[:3]}**** | Token：{token[:3]}****")
+                    logging.debug(f"准备离线缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret[:3])} | Token：{PrivacyUtils.sanitize_secret(token[:3])}")
 
                 logging.info(
-                    f"WS断开连接 | 密钥：{secret[:3]}**** | Token：{token[:3]+'****' if token else '无'} | "
+                    f"WS断开连接 | 密钥：{PrivacyUtils.sanitize_secret(secret[:3])} | Token：{PrivacyUtils.sanitize_secret(token) if token else '无'} | "
                     f"剩余连接：{remaining}"
                 )
 
@@ -540,7 +620,7 @@ async def send_to_all(secret: str, data: bytes):
     async with cache_lock:
         connections = active_connections.get(secret, {})
         websockets = list(connections.keys())
-
+    
     success_count = 0
     sandbox_success = 0
     formal_success = 0
@@ -588,12 +668,12 @@ async def send_to_all(secret: str, data: bytes):
                         except:
                             pass
                         del connections[ws]
-                        logging.warning(f"连接重试过多关闭 | 密钥：{secret[:3]}****")
+                        logging.warning(f"连接重试过多关闭 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
 
     # 记录转发结果
     if success_count > 0:
         log_parts = [
-            f"消息转发成功 | 密钥：{secret[:3]}****",
+            f"消息转发成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)}",
             f"总数：{success_count}/{len(websockets)}",
             f"沙盒：{sandbox_success}" if sandbox_success > 0 else "",
             f"正式：{formal_success}" if formal_success > 0 else ""
@@ -602,7 +682,7 @@ async def send_to_all(secret: str, data: bytes):
     
     if fail_count > 0:
         logging.warning(
-            f"消息转发失败 | 密钥：{secret[:3]}**** | "
+            f"消息转发失败 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | "
             f"失败数：{fail_count}/{len(websockets)}"
         )
 
@@ -616,13 +696,13 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
 
         # 生成日志描述
         if cache_type == 'token':
-            cache_desc = f"Token：{token[:3]}****" if token else "Token：未知"
+            cache_desc = f"Token：{token[:3]}****{token[-3:] if token and len(token) > 6 else ''}" if token else "Token：未知"
             log_prefix = "Token补发"
         else:
             cache_desc = "公共缓存"
             log_prefix = "公共补发"
 
-        logging.info(f"开始补发{cache_desc} | 密钥：{secret[:3]}**** | 总量：{total}")
+        logging.info(f"开始补发{cache_desc} | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | 总量：{total}")
 
         # 分批次发送（每秒10条）
         batch_size = 10
@@ -630,7 +710,7 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
             batch = cache_queue[i:i + batch_size]
             batch_success = 0
             batch_fail = 0
-
+            
             for expiry, msg in batch:
                 if expiry < now:
                     continue
@@ -641,27 +721,27 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
                     logging.debug(f"补发{cache_desc}消息: {msg.decode()}")
                 except Exception as e:
                     batch_fail += 1
-
+            
             success += batch_success
             fail += batch_fail
-
+            
             # 记录批次日志
             logging.info(
-                f"{log_prefix}进度 | 密钥：{secret[:3]}**** | "
+                f"{log_prefix}进度 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | "
                 f"批次：{i//batch_size + 1} | 本批：{batch_success}成功/{batch_fail}失败"
             )
-
+            
             # 严格1秒间隔
             if i + batch_size < len(cache_queue):
                 await asyncio.sleep(1)
 
         logging.info(
-            f"{cache_desc}补发完成 | 密钥：{secret[:3]}**** | "
+            f"{cache_desc}补发完成 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | "
             f"总消息：{total} | 有效消息：{valid_count} | "
             f"成功：{success} | 失败：{fail}"
         )
     except WebSocketDisconnect:
-        logging.warning(f"补发中断：WebSocket连接已关闭 | 密钥：{secret[:3]}**** | {cache_desc}")
+        logging.warning(f"补发中断：WebSocket连接已关闭 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | {cache_desc}")
     except Exception as e:
         logging.error(f"{cache_desc}补发异常: {str(e)}")
 
