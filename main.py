@@ -15,6 +15,8 @@ import re
 from urllib.parse import urlparse
 import psutil
 import platform
+import aiohttp
+from typing import List
 from models import get_session, WebhookStats, ConnectionStats
 from sqlalchemy import update, func
 
@@ -270,6 +272,54 @@ async def get_stats():
     finally:
         session.close()
 
+def load_webhook_config() -> dict:
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    return {
+        'enabled': config.getboolean('WEBHOOK_FORWARD', 'enabled', fallback=False),
+        'targets': [
+            url.strip() 
+            for url in config.get('WEBHOOK_FORWARD', 'targets', fallback='').split(',')
+            if url.strip()
+        ],
+        'timeout': config.getint('WEBHOOK_FORWARD', 'timeout', fallback=5)
+    }
+
+async def forward_webhook(
+    targets: List[str], 
+    body: bytes, 
+    headers: dict, 
+    timeout: int
+) -> list:
+    async def send_to_target(session: aiohttp.ClientSession, url: str) -> dict:
+        try:
+            async with session.post(
+                url,
+                data=body,
+                headers=headers,
+                timeout=timeout
+            ) as response:
+                return {
+                    'url': url,
+                    'status': response.status,
+                    'success': 200 <= response.status < 300
+                }
+        except Exception as e:
+            return {
+                'url': url,
+                'status': None,
+                'success': False,
+                'error': str(e)
+            }
+
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            send_to_target(session, target) 
+            for target in targets
+        ]
+        results = await asyncio.gather(*tasks)
+        return results
+
 @app.post("/webhook")
 async def handle_webhook(
         request: Request,
@@ -280,6 +330,30 @@ async def handle_webhook(
     secret = request.query_params.get('secret')
     body_bytes = await request.body()
     logging.debug(f"收到原始消息: {body_bytes}")
+
+    # 处理webhook转发
+    webhook_config = load_webhook_config()
+    if webhook_config['enabled'] and webhook_config['targets']:
+        # 获取原始请求头
+        forward_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ['host', 'content-length']
+        }
+        
+        # 异步转发
+        forward_results = await forward_webhook(
+            webhook_config['targets'],
+            body_bytes,
+            forward_headers,
+            webhook_config['timeout']
+        )
+        
+        # 记录转发结果
+        for result in forward_results:
+            if result['success']:
+                logging.info(f"Webhook转发成功 | URL: {result['url']} | 状态码: {result['status']}")
+            else:
+                logging.error(f"Webhook转发失败 | URL: {result['url']} | 错误: {result.get('error', '未知错误')}")
 
     # 更新webhook统计
     if secret:
