@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import *
-from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -8,14 +7,16 @@ from datetime import datetime, timedelta
 import logging
 import uvicorn
 import asyncio
-from collections import deque
+from collections import deque, defaultdict
 import configparser
 import os
 from pathlib import Path
 import re
 from urllib.parse import urlparse
-import aiohttp
-from typing import List
+import psutil
+import platform
+from models import get_session, WebhookStats, ConnectionStats
+from sqlalchemy import update, func
 
 try:
     import orjson
@@ -119,53 +120,155 @@ def generate_signature(bot_secret, event_ts, plain_token):
 class Payload(BaseModel):
     d: dict
 
-def load_webhook_config() -> dict:
-    config = configparser.ConfigParser()
-    config.read('config.ini')
+# 统计数据结构
+connection_stats = {
+    "history_connections": defaultdict(int),  # 历史连接数
+    "webhook_forwards": defaultdict(lambda: {"count": 0, "urls": set(), "total_bytes": 0}),  # webhook转发统计
+    "active_keys": set(),  # 活跃密钥
+}
+
+def get_system_stats():
+    """获取系统资源使用情况"""
+    process = psutil.Process(os.getpid())
+    
+    # CPU使用率
+    cpu_percent = process.cpu_percent(interval=0.1)
+    
+    # 内存使用
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    # 系统信息
+    system_info = {
+        "platform": platform.system(),
+        "platform_version": platform.version(),
+        "python_version": platform.python_version(),
+        "cpu_count": psutil.cpu_count(),
+        "total_memory": psutil.virtual_memory().total,
+    }
+    
     return {
-        'enabled': config.getboolean('WEBHOOK_FORWARD', 'enabled', fallback=False),
-        'targets': [
-            url.strip() 
-            for url in config.get('WEBHOOK_FORWARD', 'targets', fallback='').split(',')
-            if url.strip()
-        ],
-        'timeout': config.getint('WEBHOOK_FORWARD', 'timeout', fallback=5)
+        "cpu_percent": round(cpu_percent, 1),
+        "memory_used": memory_info.rss,  # 实际使用的物理内存
+        "memory_percent": round(memory_percent, 1),
+        "system_info": system_info
     }
 
-async def forward_webhook(
-    targets: List[str], 
-    body: bytes, 
-    headers: dict, 
-    timeout: int
-) -> list:
-    async def send_to_target(session: aiohttp.ClientSession, url: str) -> dict:
-        try:
-            async with session.post(
-                url,
-                data=body,
-                headers=headers,
-                timeout=timeout
-            ) as response:
-                return {
-                    'url': url,
-                    'status': response.status,
-                    'success': 200 <= response.status < 300
-                }
-        except Exception as e:
-            return {
-                'url': url,
-                'status': None,
-                'success': False,
-                'error': str(e)
-            }
+def update_webhook_stats(secret: str, url: str, bytes_count: int):
+    """更新webhook统计数据"""
+    session = get_session()
+    try:
+        stats = session.query(WebhookStats).filter_by(secret=secret, url=url).first()
+        if stats:
+            stats.count += 1
+            stats.total_bytes += bytes_count
+            stats.last_updated = datetime.now()
+        else:
+            stats = WebhookStats(
+                secret=secret,
+                url=url,
+                count=1,
+                total_bytes=bytes_count
+            )
+            session.add(stats)
+        session.commit()
+    except Exception as e:
+        logging.error(f"更新webhook统计失败: {e}")
+        session.rollback()
+    finally:
+        session.close()
 
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            send_to_target(session, target) 
-            for target in targets
-        ]
-        results = await asyncio.gather(*tasks)
-        return results
+def update_connection_stats(secret: str, is_active: bool = True):
+    """更新连接统计数据"""
+    session = get_session()
+    try:
+        stats = session.query(ConnectionStats).filter_by(secret=secret).first()
+        if stats:
+            if is_active:
+                stats.history_connections += 1
+            stats.is_active = 1 if is_active else 0
+            stats.last_updated = datetime.now()
+        else:
+            stats = ConnectionStats(
+                secret=secret,
+                history_connections=1 if is_active else 0,
+                is_active=1 if is_active else 0
+            )
+            session.add(stats)
+        session.commit()
+    except Exception as e:
+        logging.error(f"更新连接统计失败: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+@app.get("/logs")
+async def logs_page():
+    return FileResponse("logs.html")
+
+@app.get("/api/stats")
+async def get_stats():
+    session = get_session()
+    try:
+        # 获取在线连接信息
+        online_connections = []
+        total_online = 0
+        
+        for secret, connections in active_connections.items():
+            for ws, info in connections.items():
+                total_online += 1
+                online_connections.append({
+                    "secret": f"{secret[:3]}****",
+                    "token": f"{info['token'][:3]}****" if info.get('token') else None,
+                    "environment": "沙盒环境" if info.get('is_sandbox') else "正式环境",
+                    "type": "常驻连接" if info.get('token') else "临时连接"
+                })
+        
+        # 获取webhook转发信息
+        webhook_stats = session.query(WebhookStats).all()
+        webhook_forwards = []
+        total_webhooks = 0
+        total_bytes = 0
+        
+        for stats in webhook_stats:
+            total_webhooks += stats.count
+            total_bytes += stats.total_bytes
+            
+            parsed_url = urlparse(stats.url)
+            domain = parsed_url.netloc.split('.')
+            if len(domain) >= 2:
+                domain = f"{domain[0]}.{domain[1]}"
+            else:
+                domain = parsed_url.netloc
+                
+            webhook_forwards.append({
+                "secret": f"{stats.secret[:3]}****",
+                "url": f"{domain}...",
+                "count": stats.count,
+                "total_bytes": stats.total_bytes
+            })
+        
+        # 获取历史连接总数
+        history_count = session.query(func.sum(ConnectionStats.history_connections)).scalar() or 0
+        
+        # 获取活跃密钥数
+        active_keys = session.query(ConnectionStats).filter_by(is_active=1).count()
+        
+        # 获取系统资源使用情况
+        system_stats = get_system_stats()
+        
+        return {
+            "online_count": total_online,
+            "history_count": history_count,
+            "webhook_count": total_webhooks,
+            "webhook_total_bytes": total_bytes,
+            "active_keys": active_keys,
+            "online_connections": online_connections,
+            "webhook_forwards": webhook_forwards,
+            "system_stats": system_stats
+        }
+    finally:
+        session.close()
 
 @app.post("/webhook")
 async def handle_webhook(
@@ -178,31 +281,11 @@ async def handle_webhook(
     body_bytes = await request.body()
     logging.debug(f"收到原始消息: {body_bytes}")
 
-    # 处理webhook转发
-    webhook_config = load_webhook_config()
-    if webhook_config['enabled'] and webhook_config['targets']:
-        # 获取原始请求头
-        forward_headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in ['host', 'content-length']
-        }
-        
-        # 异步转发
-        forward_results = await forward_webhook(
-            webhook_config['targets'],
-            body_bytes,
-            forward_headers,
-            webhook_config['timeout']
-        )
-        
-        # 记录转发结果
-        for result in forward_results:
-            if result['success']:
-                logging.info(f"Webhook转发成功 | URL: {result['url']} | 状态码: {result['status']}")
-            else:
-                logging.error(f"Webhook转发失败 | URL: {result['url']} | 错误: {result.get('error', '未知错误')}")
+    # 更新webhook统计
+    if secret:
+        update_webhook_stats(secret, str(request.url), len(body_bytes))
 
-    # 原有的处理逻辑
+    # 处理回调验证
     if "event_ts" in payload.d and "plain_token" in payload.d:
         try:
             event_ts = payload.d["event_ts"]
@@ -276,19 +359,22 @@ async def websocket_endpoint(
 ):
     await websocket.accept()
     
+    # 更新连接统计
+    update_connection_stats(secret, True)
+
     # 发送初始心跳
     await websocket.send_bytes(json_module.dumps({
         "op": 10,
         "d": {"heartbeat_interval": 30000}
     }))
-    
+
     is_sandbox = any([group, member, content])
     environment = "沙盒环境" if is_sandbox else "正式环境"
 
     async with cache_lock:
         if secret not in active_connections:
             active_connections[secret] = {}
-        
+
         active_connections[secret][websocket] = {
             "token": token,
             "failure_count": 0,
@@ -307,7 +393,7 @@ async def websocket_endpoint(
             logging.debug(f"初始化Token队列 | 密钥：{secret[:3]}**** | Token：{token[:3]}****")
 
     logging.info(
-        f"WS连接成功 | 密钥：{secret[:3]}**** | Token：{token[:8]+'****' if token else '无'} | "
+        f"WS连接成功 | 密钥：{secret[:3]}**** | Token：{token[:3]+'****' if token else '无'} | "
         f"环境：{environment} | 连接数：{current_count}"
     )
 
@@ -329,6 +415,9 @@ async def websocket_endpoint(
                 del active_connections[secret][websocket]
                 remaining = len(active_connections[secret])
 
+                # 更新连接统计
+                update_connection_stats(secret, False)
+
                 # 确保离线token的缓存队列存在
                 if token:
                     message_cache.setdefault(secret, {"public": deque(maxlen=1000), "tokens": {}})
@@ -336,13 +425,21 @@ async def websocket_endpoint(
                     logging.debug(f"准备离线缓存 | 密钥：{secret[:3]}**** | Token：{token[:3]}****")
 
                 logging.info(
-                    f"WS断开连接 | 密钥：{secret[:3]}**** | Token：{token[:8]+'****' if token else '无'} | "
+                    f"WS断开连接 | 密钥：{secret[:3]}**** | Token：{token[:3]+'****' if token else '无'} | "
                     f"剩余连接：{remaining}"
                 )
-    finally:
+
+                if not active_connections[secret]:
+                    del active_connections[secret]
+                    connection_stats["active_keys"].discard(secret)
+    except Exception as e:
+        logging.error(f"WS连接异常: {str(e)}")
         async with cache_lock:
             if secret in active_connections and websocket in active_connections[secret]:
                 del active_connections[secret][websocket]
+                if not active_connections[secret]:
+                    del active_connections[secret]
+                    connection_stats["active_keys"].discard(secret)
 
 async def handle_ws_message(message: str, websocket: WebSocket):
     try:
@@ -369,7 +466,7 @@ async def send_to_all(secret: str, data: bytes):
     async with cache_lock:
         connections = active_connections.get(secret, {})
         websockets = list(connections.keys())
-    
+
     success_count = 0
     sandbox_success = 0
     formal_success = 0
@@ -459,7 +556,7 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
             batch = cache_queue[i:i + batch_size]
             batch_success = 0
             batch_fail = 0
-            
+
             for expiry, msg in batch:
                 if expiry < now:
                     continue
@@ -470,16 +567,16 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
                     logging.debug(f"补发{cache_desc}消息: {msg.decode()}")
                 except Exception as e:
                     batch_fail += 1
-            
+
             success += batch_success
             fail += batch_fail
-            
+
             # 记录批次日志
             logging.info(
                 f"{log_prefix}进度 | 密钥：{secret[:3]}**** | "
                 f"批次：{i//batch_size + 1} | 本批：{batch_success}成功/{batch_fail}失败"
             )
-            
+
             # 严格1秒间隔
             if i + batch_size < len(cache_queue):
                 await asyncio.sleep(1)
