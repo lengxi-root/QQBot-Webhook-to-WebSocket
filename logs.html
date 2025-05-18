@@ -334,24 +334,23 @@
                     document.getElementById('total-webhook-bytes').textContent = formatBytes(data.webhook_total_bytes);
                     document.getElementById('active-keys').textContent = data.active_keys;
 
-                    // 更新系统资源信息
-                    const systemStats = data.system_stats;
-                    document.getElementById('cpu-percent').textContent = systemStats.cpu_percent + '%';
-                    document.getElementById('memory-percent').textContent = systemStats.memory_percent + '%';
-                    updateProgressBar(document.getElementById('cpu-bar'), systemStats.cpu_percent);
-                    updateProgressBar(document.getElementById('memory-bar'), systemStats.memory_percent);
-
-                    // 更新系统信息
-                    document.getElementById('cpu-count').textContent = systemStats.system_info.cpu_count + ' 核心';
-                    const usedMemory = systemStats.system_info.total_memory * (systemStats.memory_percent / 100);
-                    document.getElementById('memory-usage').textContent = 
-                        `${formatBytes(usedMemory)} / ${formatBytes(systemStats.system_info.total_memory)}`;
-
                     // 更新在线连接表格
                     const onlineTable = document.getElementById('online-connections');
-                    onlineTable.innerHTML = data.online_connections.map(conn => `
+                    const allConnections = [
+                        ...(data.online_connections || []).map(conn => ({...conn, is_online: true})),
+                        ...(data.offline_connections || []).map(conn => ({...conn, is_online: false}))
+                    ];
+                    
+                    onlineTable.innerHTML = allConnections.map(conn => `
                         <tr class="table-row border-t border-gray-700 fade-in">
-                            <td class="py-3 px-4">${conn.secret}</td>
+                            <td class="py-3 px-4">
+                                <div class="flex items-center">
+                                    ${conn.is_online ? 
+                                        '<span class="badge bg-success mr-2">在线</span>' : 
+                                        '<span class="badge bg-secondary mr-2">离线</span>'}
+                                    ${conn.secret}
+                                </div>
+                            </td>
                             <td class="py-3 px-4">${conn.token || '<span class="text-gray-500">无</span>'}</td>
                             <td class="py-3 px-4">
                                 <span class="badge ${conn.environment === '沙盒环境' ? 'badge-sandbox' : 'badge-formal'}">
@@ -367,6 +366,19 @@
                             </td>
                         </tr>
                     `).join('');
+
+                    // 更新系统资源信息
+                    const systemStats = data.system_stats;
+                    document.getElementById('cpu-percent').textContent = systemStats.cpu_percent + '%';
+                    document.getElementById('memory-percent').textContent = systemStats.memory_percent + '%';
+                    updateProgressBar(document.getElementById('cpu-bar'), systemStats.cpu_percent);
+                    updateProgressBar(document.getElementById('memory-bar'), systemStats.memory_percent);
+
+                    // 更新系统信息
+                    document.getElementById('cpu-count').textContent = systemStats.system_info.cpu_count + ' 核心';
+                    const usedMemory = systemStats.system_info.total_memory * (systemStats.memory_percent / 100);
+                    document.getElementById('memory-usage').textContent = 
+                        `${formatBytes(usedMemory)} / ${formatBytes(systemStats.system_info.total_memory)}`;
 
                     // 更新Webhook转发表格
                     const webhookTable = document.getElementById('webhook-forwards');
@@ -394,9 +406,7 @@
                         </tr>
                     `).join('');
                 })
-                .catch(error => {
-                    console.error('获取统计数据失败:', error);
-                });
+                .catch(error => console.error('Error:', error));
         }
 
         // 每5秒更新一次数据

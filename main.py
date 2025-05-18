@@ -133,6 +133,8 @@ async def privacy_middleware(request: Request, call_next):
 active_connections = {}  # {secret: {websocket: {"token": str, ...}}}
 message_cache = {}       # {secret: {"public": deque(), "tokens": {token: deque()}}}
 cache_lock = asyncio.Lock()
+webhook_retry_cache = {}  # {url: {"body": bytes, "headers": dict, "secret": str, "retry_time": datetime}}
+message_id_cache = {}     # {message_id: expiry_timestamp}
 
 # 日志配置
 def load_log_config():
@@ -373,13 +375,39 @@ async def forward_webhook(
                 headers=headers,
                 timeout=timeout
             ) as response:
-                return {
+                success = 200 <= response.status < 300
+                result = {
                     'url': target['url'],
                     'status': response.status,
-                    'success': 200 <= response.status < 300,
+                    'success': success,
                     'skipped': False
                 }
+                
+                # 如果请求失败（非2xx状态码），将请求缓存起来等待重试
+                if not success:
+                    retry_time = datetime.now() + timedelta(seconds=10)
+                    webhook_retry_cache[target['url']] = {
+                        'body': body,
+                        'headers': headers,
+                        'secret': current_secret,
+                        'retry_time': retry_time,
+                        'retried': False  # 标记为未重试
+                    }
+                    logging.info(f"Webhook请求失败（状态码: {response.status}），已加入重试队列：{PrivacyUtils.sanitize_url(target['url'])}")
+                
+                return result
         except Exception as e:
+            # 发生异常时也将请求加入重试队列
+            retry_time = datetime.now() + timedelta(seconds=10)
+            webhook_retry_cache[target['url']] = {
+                'body': body,
+                'headers': headers, 
+                'secret': current_secret,
+                'retry_time': retry_time,
+                'retried': False  # 标记为未重试
+            }
+            logging.error(f"Webhook请求异常，已加入重试队列：{PrivacyUtils.sanitize_url(target['url'])} | 错误: {str(e)}")
+            
             return {
                 'url': target['url'],
                 'status': None,
@@ -406,6 +434,30 @@ async def handle_webhook(
     secret = request.query_params.get('secret')
     body_bytes = await request.body()
     logging.debug(f"收到原始消息: {body_bytes}")
+
+    # 消息ID检查和去重处理
+    try:
+        message_data = json_module.loads(body_bytes)
+        message_id = message_data.get('id')
+        
+        # 如果存在消息ID，检查是否已经处理过
+        if message_id:
+            now = datetime.now()
+            
+            # 清理过期的消息ID缓存
+            expired_ids = [id for id, expiry in message_id_cache.items() if expiry < now]
+            for id in expired_ids:
+                message_id_cache.pop(id, None)
+            
+            # 检查当前消息是否已存在于缓存中
+            if message_id in message_id_cache:
+                logging.info(f"检测到重复消息ID，忽略处理: {message_id}")
+                return {"status": "ignored", "reason": "duplicate message"}
+            
+            # 将当前消息ID添加到缓存中，有效期20秒
+            message_id_cache[message_id] = now + timedelta(seconds=20)
+    except Exception as e:
+        logging.error(f"消息去重处理异常: {str(e)}")
 
     # 处理webhook转发
     webhook_config = load_webhook_config()
@@ -823,9 +875,70 @@ async def watch_config():
             logging.error(f"配置文件监视错误: {str(e)}")
         await asyncio.sleep(20)
 
+async def process_webhook_retry_queue():
+    """处理webhook重试队列的后台任务"""
+    while True:
+        try:
+            now = datetime.now()
+            urls_to_retry = []
+            
+            # 找出需要重试的URL
+            for url, data in webhook_retry_cache.items():
+                if now >= data['retry_time'] and not data['retried']:
+                    urls_to_retry.append(url)
+            
+            # 重试发送请求
+            if urls_to_retry:
+                logging.info(f"开始处理webhook重试队列，共{len(urls_to_retry)}个请求")
+                
+                async with aiohttp.ClientSession() as session:
+                    for url in urls_to_retry:
+                        data = webhook_retry_cache[url]
+                        try:
+                            async with session.post(
+                                url,
+                                data=data['body'],
+                                headers=data['headers'],
+                                timeout=10  # 重试请求的超时设置为10秒
+                            ) as response:
+                                success = 200 <= response.status < 300
+                                if success:
+                                    logging.info(f"Webhook重试成功: {PrivacyUtils.sanitize_url(url)} | 状态码: {response.status}")
+                                    # 成功后从缓存中删除
+                                    webhook_retry_cache.pop(url, None)
+                                else:
+                                    logging.warn(f"Webhook重试仍然失败: {PrivacyUtils.sanitize_url(url)} | 状态码: {response.status}")
+                                    # 标记为已重试，不再进行后续重试
+                                    data['retried'] = True
+                        except Exception as e:
+                            logging.error(f"Webhook重试异常: {PrivacyUtils.sanitize_url(url)} | 错误: {str(e)}")
+                            # 标记为已重试，不再进行后续重试
+                            data['retried'] = True
+                            
+                # 清理已经重试过的记录
+                urls_to_remove = [url for url, data in webhook_retry_cache.items() if data['retried']]
+                for url in urls_to_remove:
+                    webhook_retry_cache.pop(url, None)
+                
+                if urls_to_remove:
+                    logging.info(f"清理已重试的webhook请求，共{len(urls_to_remove)}个")
+            
+            # 等待1秒再检查
+            await asyncio.sleep(1)
+            
+        except Exception as e:
+            logging.error(f"处理webhook重试队列异常: {str(e)}")
+            await asyncio.sleep(5)  # 发生异常时等待长一点再重试
+
 @app.on_event("startup")
 async def startup_event():
+    # 启动配置监控任务
     asyncio.create_task(watch_config())
+    
+    # 启动webhook重试队列处理任务
+    asyncio.create_task(process_webhook_retry_queue())
+    
+    logging.info(f"服务已启动")
 
 if __name__ == "__main__":
     uvicorn.run(
