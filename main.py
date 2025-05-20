@@ -133,7 +133,6 @@ async def privacy_middleware(request: Request, call_next):
 active_connections = {}  # {secret: {websocket: {"token": str, ...}}}
 message_cache = {}       # {secret: {"public": deque(), "tokens": {token: deque()}}}
 cache_lock = asyncio.Lock()
-webhook_retry_cache = {}  # {url: {"body": bytes, "headers": dict, "secret": str, "retry_time": datetime}}
 message_id_cache = {}     # {message_id: expiry_timestamp}
 
 # 日志配置
@@ -144,6 +143,21 @@ def load_log_config():
     if log_level == "TESTING":
         log_level = "DEBUG"
     return log_level
+
+# 加载消息去重配置
+def load_deduplication_config():
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    return config.getint('DEFAULT', 'deduplication_ttl', fallback=20)
+
+# 加载原始内容记录配置
+def load_raw_content_config():
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    return {
+        'enabled': config.getboolean('DEFAULT', 'save_raw_content', fallback=False),
+        'path': config.get('DEFAULT', 'raw_content_path', fallback='logs')
+    }
 
 # 初始化日志
 log_level = load_log_config()
@@ -382,32 +396,8 @@ async def forward_webhook(
                     'success': success,
                     'skipped': False
                 }
-                
-                # 如果请求失败（非2xx状态码），将请求缓存起来等待重试
-                if not success:
-                    retry_time = datetime.now() + timedelta(seconds=10)
-                    webhook_retry_cache[target['url']] = {
-                        'body': body,
-                        'headers': headers,
-                        'secret': current_secret,
-                        'retry_time': retry_time,
-                        'retried': False  # 标记为未重试
-                    }
-                    logging.info(f"Webhook请求失败（状态码: {response.status}），已加入重试队列：{PrivacyUtils.sanitize_url(target['url'])}")
-                
                 return result
         except Exception as e:
-            # 发生异常时也将请求加入重试队列
-            retry_time = datetime.now() + timedelta(seconds=10)
-            webhook_retry_cache[target['url']] = {
-                'body': body,
-                'headers': headers, 
-                'secret': current_secret,
-                'retry_time': retry_time,
-                'retried': False  # 标记为未重试
-            }
-            logging.error(f"Webhook请求异常，已加入重试队列：{PrivacyUtils.sanitize_url(target['url'])} | 错误: {str(e)}")
-            
             return {
                 'url': target['url'],
                 'status': None,
@@ -434,15 +424,28 @@ async def handle_webhook(
     secret = request.query_params.get('secret')
     body_bytes = await request.body()
     logging.debug(f"收到原始消息: {body_bytes}")
-
+    
+    # 获取客户端IP地址
+    client_host = request.client.host if request.client else "unknown"
+    client_port = request.client.port if request.client else 0
+    client_ip = f"{client_host}:{client_port}"
+    logging.info(f"收到来自 {client_ip} 的消息")
+    
+    message_id = None
     # 消息ID检查和去重处理
     try:
         message_data = json_module.loads(body_bytes)
         message_id = message_data.get('id')
         
+        # 保存原始内容（初始状态）
+        save_raw_content(body_bytes, secret, message_id, "接收", client_ip)
+        
         # 如果存在消息ID，检查是否已经处理过
         if message_id:
             now = datetime.now()
+            
+            # 获取去重有效期配置
+            deduplication_ttl = load_deduplication_config()
             
             # 清理过期的消息ID缓存
             expired_ids = [id for id, expiry in message_id_cache.items() if expiry < now]
@@ -451,14 +454,37 @@ async def handle_webhook(
             
             # 检查当前消息是否已存在于缓存中
             if message_id in message_id_cache:
-                logging.info(f"检测到重复消息ID，忽略处理: {message_id}")
-                return {"status": "ignored", "reason": "duplicate message"}
+                logging.info(f"检测到重复消息ID，跳过所有处理和转发: {message_id} | IP: {client_ip}")
+                # 更新消息状态
+                save_raw_content(body_bytes, secret, message_id, "重复消息-不转发", client_ip)
+                return {"status": "success"}  # 直接返回，不进行后续任何处理
             
-            # 将当前消息ID添加到缓存中，有效期20秒
-            message_id_cache[message_id] = now + timedelta(seconds=20)
+            # 将当前消息ID添加到缓存中，有效期从配置中读取
+            message_id_cache[message_id] = now + timedelta(seconds=deduplication_ttl)
+            logging.debug(f"添加消息ID到缓存，有效期{deduplication_ttl}秒: {message_id}")
     except Exception as e:
         logging.error(f"消息去重处理异常: {str(e)}")
+        # 更新消息状态
+        save_raw_content(body_bytes, secret, message_id, "解析异常", client_ip)
 
+    # 处理回调验证
+    if "event_ts" in payload.d and "plain_token" in payload.d:
+        try:
+            event_ts = payload.d["event_ts"]
+            plain_token = payload.d["plain_token"]
+            # 更新消息状态
+            save_raw_content(body_bytes, secret, message_id, "回调验证", client_ip)
+            result = generate_signature(secret, event_ts, plain_token)
+            return result
+        except Exception as e:
+            logging.error(f"签名错误: {e}")
+            # 更新消息状态
+            save_raw_content(body_bytes, secret, message_id, "签名错误", client_ip)
+            return {"status": "error"}
+
+    # 转发状态
+    forward_status = "转发状态：未知"
+            
     # 处理webhook转发
     webhook_config = load_webhook_config()
     if webhook_config['enabled'] and webhook_config['targets']:
@@ -478,29 +504,25 @@ async def handle_webhook(
         )
         
         # 记录转发结果
+        success_count = 0
+        fail_count = 0
+        
         for result in forward_results:
             sanitized_url = PrivacyUtils.sanitize_url(result['url'])
             if result.get('skipped', False):
                 logging.debug(f"Webhook转发跳过 | URL: {sanitized_url} | 原因: {result.get('reason', '未知')}")
             elif result['success']:
+                success_count += 1
                 logging.info(f"Webhook转发成功 | URL: {sanitized_url} | 状态码: {result['status']}")
             else:
+                fail_count += 1
                 logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
+        
+        forward_status = f"Webhook转发：成功{success_count}，失败{fail_count}"
 
     # 更新webhook统计
     if secret:
         update_webhook_stats(secret, str(request.url), len(body_bytes))
-
-    # 处理回调验证
-    if "event_ts" in payload.d and "plain_token" in payload.d:
-        try:
-            event_ts = payload.d["event_ts"]
-            plain_token = payload.d["plain_token"]
-            result = generate_signature(secret, event_ts, plain_token)
-            return result
-        except Exception as e:
-            logging.error(f"签名错误: {e}")
-            return {"status": "error"}
 
     # 消息处理逻辑
     async with cache_lock:
@@ -525,6 +547,9 @@ async def handle_webhook(
         if not has_online:
             cache["public"].append((expiry, body_bytes))
             logging.info(f"消息存入公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{len(cache['public'])}")
+            forward_status += " | WS：无在线连接-已缓存"
+        else:
+            forward_status += " | WS：有在线连接"
 
         # 处理token缓存
         offline_tokens = []
@@ -551,8 +576,13 @@ async def handle_webhook(
             logging.info(f"消息存入Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{len(deque_token)}")
 
     # 实时转发
-    await send_to_all(secret, body_bytes)
-    return {"status": "delivered" if has_online else "cached"}
+    if has_online:
+        await send_to_all(secret, body_bytes)
+    
+    # 最终更新消息状态
+    save_raw_content(body_bytes, secret, message_id, forward_status, client_ip)
+    
+    return {"status": "success"}
 
 @app.websocket("/ws/{secret}")
 async def websocket_endpoint(
@@ -863,6 +893,15 @@ async def watch_config():
                         handler.setLevel(new_level)
                     last_valid_level = new_level
                     logging.info(f"检测到配置文件更新，日志级别已更改为：{new_level}")
+                    
+                    # 输出去重配置更新日志
+                    deduplication_ttl = config.getint('DEFAULT', 'deduplication_ttl', fallback=20)
+                    logging.info(f"消息去重有效期配置为：{deduplication_ttl}秒")
+                    
+                    # 输出原始内容记录配置更新日志
+                    raw_content_enabled = config.getboolean('DEFAULT', 'save_raw_content', fallback=False)
+                    raw_content_path = config.get('DEFAULT', 'raw_content_path', fallback='logs')
+                    logging.info(f"原始内容记录：{'启用' if raw_content_enabled else '禁用'}, 路径: {raw_content_path}")
                 else:
                     logger.setLevel(last_valid_level)
                     for handler in logger.handlers:
@@ -875,70 +914,65 @@ async def watch_config():
             logging.error(f"配置文件监视错误: {str(e)}")
         await asyncio.sleep(20)
 
-async def process_webhook_retry_queue():
-    """处理webhook重试队列的后台任务"""
-    while True:
-        try:
-            now = datetime.now()
-            urls_to_retry = []
-            
-            # 找出需要重试的URL
-            for url, data in webhook_retry_cache.items():
-                if now >= data['retry_time'] and not data['retried']:
-                    urls_to_retry.append(url)
-            
-            # 重试发送请求
-            if urls_to_retry:
-                logging.info(f"开始处理webhook重试队列，共{len(urls_to_retry)}个请求")
-                
-                async with aiohttp.ClientSession() as session:
-                    for url in urls_to_retry:
-                        data = webhook_retry_cache[url]
-                        try:
-                            async with session.post(
-                                url,
-                                data=data['body'],
-                                headers=data['headers'],
-                                timeout=10  # 重试请求的超时设置为10秒
-                            ) as response:
-                                success = 200 <= response.status < 300
-                                if success:
-                                    logging.info(f"Webhook重试成功: {PrivacyUtils.sanitize_url(url)} | 状态码: {response.status}")
-                                    # 成功后从缓存中删除
-                                    webhook_retry_cache.pop(url, None)
-                                else:
-                                    logging.warn(f"Webhook重试仍然失败: {PrivacyUtils.sanitize_url(url)} | 状态码: {response.status}")
-                                    # 标记为已重试，不再进行后续重试
-                                    data['retried'] = True
-                        except Exception as e:
-                            logging.error(f"Webhook重试异常: {PrivacyUtils.sanitize_url(url)} | 错误: {str(e)}")
-                            # 标记为已重试，不再进行后续重试
-                            data['retried'] = True
-                            
-                # 清理已经重试过的记录
-                urls_to_remove = [url for url, data in webhook_retry_cache.items() if data['retried']]
-                for url in urls_to_remove:
-                    webhook_retry_cache.pop(url, None)
-                
-                if urls_to_remove:
-                    logging.info(f"清理已重试的webhook请求，共{len(urls_to_remove)}个")
-            
-            # 等待1秒再检查
-            await asyncio.sleep(1)
-            
-        except Exception as e:
-            logging.error(f"处理webhook重试队列异常: {str(e)}")
-            await asyncio.sleep(5)  # 发生异常时等待长一点再重试
-
 @app.on_event("startup")
 async def startup_event():
     # 启动配置监控任务
     asyncio.create_task(watch_config())
     
-    # 启动webhook重试队列处理任务
-    asyncio.create_task(process_webhook_retry_queue())
-    
     logging.info(f"服务已启动")
+
+# 保存原始内容到日志文件
+def save_raw_content(content_bytes, secret, message_id=None, status=None, client_ip=None):
+    try:
+        config = load_raw_content_config()
+        if not config['enabled']:
+            return False
+            
+        # 创建日志文件夹
+        log_dir = Path(config['path'])
+        log_dir.mkdir(exist_ok=True, parents=True)
+        
+        # 生成当前日期的文件名
+        current_date = datetime.now().strftime('%Y%m%d')
+        filename = f"webhook_raw_{current_date}.log"
+        file_path = log_dir / filename
+        
+        # 获取当前时间戳
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        # 添加消息分隔符和元信息
+        secret_prefix = PrivacyUtils.sanitize_secret(secret) if secret else "unknown"
+        message_info = f"[{timestamp}] Secret: {secret_prefix}"
+        
+        # 添加IP地址信息
+        if client_ip:
+            message_info += f" | IP: {client_ip}"
+        
+        # 添加消息ID信息
+        if message_id:
+            message_info += f" | Message ID: {message_id}"
+            
+        # 添加消息状态信息
+        if status:
+            message_info += f" | Status: {status}"
+            
+        separator = f"\n\n---------\n{message_info}\n"
+        
+        # 以追加模式打开文件并写入内容
+        try:
+            content_str = content_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            content_str = f"[Binary content, length: {len(content_bytes)} bytes]"
+            
+        with open(file_path, 'a', encoding='utf-8') as f:
+            f.write(separator)
+            f.write(content_str)
+            
+        logging.info(f"原始内容已追加到文件: {filename}")
+        return True
+    except Exception as e:
+        logging.error(f"保存原始内容失败: {str(e)}")
+        return False
 
 if __name__ == "__main__":
     uvicorn.run(
