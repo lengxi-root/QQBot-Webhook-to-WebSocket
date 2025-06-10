@@ -19,6 +19,7 @@ import aiohttp
 from typing import List
 from models import get_session, WebhookStats, ConnectionStats
 from sqlalchemy import update, func
+from contextlib import asynccontextmanager
 
 try:
     import orjson
@@ -29,7 +30,23 @@ except ImportError:
     json_module = json
     JSONDecodeError = json.JSONDecodeError
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动配置监控任务
+    task = asyncio.create_task(watch_config())
+    logging.info(f"服务已启动")
+    
+    yield
+    
+    # 清理资源
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    logging.info(f"服务已停止")
+
+app = FastAPI(lifespan=lifespan)
 
 # 跨域配置
 app.add_middleware(
@@ -158,6 +175,15 @@ def load_raw_content_config():
         'enabled': config.getboolean('DEFAULT', 'save_raw_content', fallback=False),
         'path': config.get('DEFAULT', 'raw_content_path', fallback='logs')
     }
+
+# 加载不缓存的密钥列表
+def load_no_cache_secrets():
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+    no_cache_secrets = config.get('DEFAULT', 'no_cache_secrets', fallback='').strip()
+    if not no_cache_secrets:
+        return []
+    return [secret.strip() for secret in no_cache_secrets.split(',')]
 
 # 初始化日志
 log_level = load_log_config()
@@ -429,7 +455,6 @@ async def handle_webhook(
     client_host = request.client.host if request.client else "unknown"
     client_port = request.client.port if request.client else 0
     client_ip = f"{client_host}:{client_port}"
-    logging.info(f"收到来自 {client_ip} 的消息")
     
     message_id = None
     # 消息ID检查和去重处理
@@ -524,56 +549,69 @@ async def handle_webhook(
     if secret:
         update_webhook_stats(secret, str(request.url), len(body_bytes))
 
+    # 获取不缓存的密钥列表
+    no_cache_secrets = load_no_cache_secrets()
+    
+    # 检查当前密钥是否在不缓存列表中
+    skip_cache = secret in no_cache_secrets
+    if skip_cache:
+        forward_status += " | 不缓存密钥"
+
     # 消息处理逻辑
     async with cache_lock:
         now = datetime.now()
         expiry = now + timedelta(minutes=5)
         has_online = secret in active_connections and len(active_connections[secret]) > 0
 
-        # 初始化缓存结构
-        if secret not in message_cache:
-            message_cache[secret] = {"public": deque(maxlen=1000), "tokens": {}}
-        cache = message_cache[secret]
+        if not skip_cache:
+            # 初始化缓存结构
+            if secret not in message_cache:
+                message_cache[secret] = {"public": deque(maxlen=1000), "tokens": {}}
+            cache = message_cache[secret]
 
-        # 清理公共缓存
-        expired_public = 0
-        while cache["public"] and cache["public"][0][0] < now:
-            cache["public"].popleft()
-            expired_public += 1
-        if expired_public > 0:
-            logging.debug(f"清理公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{expired_public}")
+            # 清理公共缓存
+            expired_public = 0
+            while cache["public"] and cache["public"][0][0] < now:
+                cache["public"].popleft()
+                expired_public += 1
+            if expired_public > 0:
+                logging.debug(f"清理公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{expired_public}")
 
-        # 没有在线连接时缓存到公共
-        if not has_online:
-            cache["public"].append((expiry, body_bytes))
-            logging.info(f"消息存入公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{len(cache['public'])}")
-            forward_status += " | WS：无在线连接-已缓存"
+            # 没有在线连接时缓存到公共
+            if not has_online:
+                cache["public"].append((expiry, body_bytes))
+                logging.info(f"消息存入公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 数量：{len(cache['public'])}")
+                forward_status += " | WS：无在线连接-已缓存"
+            else:
+                forward_status += " | WS：有在线连接"
+
+            # 处理token缓存
+            offline_tokens = []
+            for token in cache["tokens"].keys():
+                token_has_online = any(
+                    conn.get("token") == token 
+                    for conn in active_connections.get(secret, {}).values()
+                )
+                if not token_has_online:
+                    offline_tokens.append(token)
+
+            for token in offline_tokens:
+                deque_token = cache["tokens"][token]
+                
+                # 清理过期
+                expired = 0
+                while deque_token and deque_token[0][0] < now:
+                    deque_token.popleft()
+                    expired += 1
+                if expired > 0:
+                    logging.debug(f"清理Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{expired}")
+                
+                deque_token.append((expiry, body_bytes))
+                logging.info(f"消息存入Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{len(deque_token)}")
+        elif not has_online:
+            forward_status += " | WS：无在线连接-不缓存"
         else:
             forward_status += " | WS：有在线连接"
-
-        # 处理token缓存
-        offline_tokens = []
-        for token in cache["tokens"].keys():
-            token_has_online = any(
-                conn.get("token") == token 
-                for conn in active_connections.get(secret, {}).values()
-            )
-            if not token_has_online:
-                offline_tokens.append(token)
-
-        for token in offline_tokens:
-            deque_token = cache["tokens"][token]
-            
-            # 清理过期
-            expired = 0
-            while deque_token and deque_token[0][0] < now:
-                deque_token.popleft()
-                expired += 1
-            if expired > 0:
-                logging.debug(f"清理Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{expired}")
-            
-            deque_token.append((expiry, body_bytes))
-            logging.info(f"消息存入Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 数量：{len(deque_token)}")
 
     # 实时转发
     if has_online:
@@ -902,6 +940,14 @@ async def watch_config():
                     raw_content_enabled = config.getboolean('DEFAULT', 'save_raw_content', fallback=False)
                     raw_content_path = config.get('DEFAULT', 'raw_content_path', fallback='logs')
                     logging.info(f"原始内容记录：{'启用' if raw_content_enabled else '禁用'}, 路径: {raw_content_path}")
+                    
+                    # 输出不缓存密钥配置更新日志
+                    no_cache_secrets = load_no_cache_secrets()
+                    if no_cache_secrets:
+                        sanitized_secrets = [PrivacyUtils.sanitize_secret(s) for s in no_cache_secrets]
+                        logging.info(f"不缓存密钥列表：{', '.join(sanitized_secrets)}")
+                    else:
+                        logging.info("不缓存密钥列表：无")
                 else:
                     logger.setLevel(last_valid_level)
                     for handler in logger.handlers:
@@ -913,13 +959,6 @@ async def watch_config():
         except Exception as e:
             logging.error(f"配置文件监视错误: {str(e)}")
         await asyncio.sleep(20)
-
-@app.on_event("startup")
-async def startup_event():
-    # 启动配置监控任务
-    asyncio.create_task(watch_config())
-    
-    logging.info(f"服务已启动")
 
 # 保存原始内容到日志文件
 def save_raw_content(content_bytes, secret, message_id=None, status=None, client_ip=None):
