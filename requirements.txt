@@ -9,4 +9,5 @@ httptools==0.6.4
 aiohttp==3.9.1
 python-multipart==0.0.6
 psutil==7.0.0
-sqlalchemy==2.0.27
+SQLAlchemy==2.0.27
+aiosqlite==0.21.0
