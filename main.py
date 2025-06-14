@@ -853,7 +853,6 @@ async def handle_webhook(
                     logging.debug(f"Webhook转发跳过 | URL: {sanitized_url} | 原因: {result.get('reason', '未知')}")
                 elif result['success']:
                     success_count += 1
-                    logging.info(f"Webhook转发成功 | URL: {sanitized_url} | 状态码: {result['status']}")
                 else:
                     fail_count += 1
                     logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
