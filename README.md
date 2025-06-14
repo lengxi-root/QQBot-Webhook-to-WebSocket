@@ -1,6 +1,9 @@
 # Webhook to WebSocket Bridge Service
 
 ## 📝 项目简介
+由于uvloop不支持Windows系统，本项目对原项目做了针对windows的兼容，主要有两个需要注意的：
+1. 代码中配置SSL证书路径
+2. 安装 "uvicorn[standard]" 包而不是 "uvicorn" 包
 
 为提供QQBot的Webhook到WebSocket的实时消息转发能力，以ws将消息推送到客户端，支持消息缓存断线重传、高稳定并发等特性。
 ！！仅做桥接转换，不支持转换为onebot协议连接
@@ -26,21 +29,21 @@
 
 ### 部署步骤
 
-1. **创建Python站点**
-   - 宝塔面板：网站管理 -> Python项目 -> 添加项目
-   - 选择requirements.txt创建环境
-
-2. **配置域名与SSL**
+1. **配置域名与SSL**
    - 绑定域名
-   - 开启外网映射（端口8000）
-   - 申请Let's Encrypt证书
+   - 开启外网映射（端口8443）
+   - 申请Let's Encrypt证书(https://console.letsencrypt.top/)，申请后将证书下载下来(选择key/pem格式)
+
+2. **部署站点**
+   - 将SSL证书的绝对路径写入代码中
+   - 运行程序
 
 3. **配置QQ开放平台**
-   - 事件通知地址：`https://{域名}/webhook?secret={机器人密钥}`
+   - 事件通知地址：`https://{域名}:8443/webhook?secret={机器人密钥}`
    - 配置事件接收
 
 4. **连接WebSocket**
-   - 连接地址：`ws://{域名}:8000/ws/{机器人密钥}`
+   - 连接地址：`wss://{域名}:8443/ws/{机器人密钥}`
    - 推荐使用WSS安全连接
 
 ## 📝 关于 Issues
