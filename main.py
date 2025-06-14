@@ -1430,23 +1430,44 @@ if __name__ == "__main__":
     # 确保数据库表已创建
     asyncio.run(ensure_tables())
 
-    # 构建SSL配置
-    # ssl_keyfile 放 .key的绝对路径
-    # ssl_certfile 放 .pem的绝对路径
-    ssl_kwargs = {
-        "ssl_keyfile": "",
-        "ssl_certfile": ""
-    }
+    # 读取SSL配置
+    def load_ssl_config():
+        config = configparser.ConfigParser()
+        config.read('config.ini', encoding='UTF-8')
+        
+        # 尝试从配置读取
+        if 'SSL' in config:
+            return {
+                "ssl_keyfile": config.get('SSL', 'ssl_keyfile', fallback=""),
+                "ssl_certfile": config.get('SSL', 'ssl_certfile', fallback=""),
+            }
+        return {
+            "ssl_keyfile": "",
+            "ssl_certfile": ""
+        }
+
+    # 加载SSL配置
+    ssl_kwargs = load_ssl_config()
+
+    # 设置端口
+    port = 8443 if ssl_kwargs["ssl_keyfile"] and ssl_kwargs["ssl_certfile"] else 8000
 
     # 创建UVICORN配置
     config = uvicorn.Config(
         app,
         host="0.0.0.0",
-        port=8443,
-        **ssl_kwargs,
+        port=port,
         log_config=None,
         access_log=False
     )
+
+    # 只有当证书都不为空时才添加SSL配置
+    if ssl_kwargs["ssl_keyfile"] and ssl_kwargs["ssl_certfile"]:
+        config.ssl_keyfile = ssl_kwargs["ssl_keyfile"]
+        config.ssl_certfile = ssl_kwargs["ssl_certfile"]
+        logging.info(f"启用SSL，监听端口: {port}")
+    else:
+        logging.info(f"未启用SSL，监听端口: {port}")
 
     # 启动服务
     server = uvicorn.Server(config)
