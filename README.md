@@ -1,10 +1,6 @@
 # Webhook to WebSocket Bridge Service
 
 ## 📝 项目简介
-由于uvloop不支持Windows系统，本项目对原项目做了针对windows的兼容，主要有两个需要注意的：
-1. 代码中配置SSL证书路径
-2. 安装 "uvicorn[standard]" 包而不是 "uvicorn" 包
-
 为提供QQBot的Webhook到WebSocket的实时消息转发能力，以ws将消息推送到客户端，支持消息缓存断线重传、高稳定并发等特性。
 ！！仅做桥接转换，不支持转换为onebot协议连接
 
@@ -32,7 +28,7 @@
 1. **配置域名与SSL**
    - 绑定域名
    - 开启外网映射（端口8443）
-   - 申请Let's Encrypt证书(https://console.letsencrypt.top/)，申请后将证书下载下来(选择key/pem格式)
+   - 申请zero证书（支持ip）([zero申请](https://app.zerossl.com/))，申请后将证书下载下来
 
 2. **部署站点**
    - 将SSL证书的绝对路径写入代码中
