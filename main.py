@@ -644,6 +644,7 @@ async def forward_webhook(
             }
 
         try:
+            # 第一次尝试
             async with session.post(
                     target['url'],
                     data=body,
@@ -651,21 +652,69 @@ async def forward_webhook(
                     timeout=timeout
             ) as response:
                 success = 200 <= response.status < 300
-                result = {
-                    'url': target['url'],
-                    'status': response.status,
-                    'success': success,
-                    'skipped': False
-                }
-                return result
+                if success:
+                    return {
+                        'url': target['url'],
+                        'status': response.status,
+                        'success': True,
+                        'skipped': False,
+                        'retried': False
+                    }
+                
+                # 第一次失败，等待3秒后重试
+                logging.info(f"Webhook转发首次失败，3秒后重试 | URL: {PrivacyUtils.sanitize_url(target['url'])} | 状态码: {response.status}")
+                await asyncio.sleep(3)
+                
+                # 重试
+                async with session.post(
+                        target['url'],
+                        data=body,
+                        headers=headers,
+                        timeout=timeout
+                ) as retry_response:
+                    retry_success = 200 <= retry_response.status < 300
+                    return {
+                        'url': target['url'],
+                        'status': retry_response.status,
+                        'success': retry_success,
+                        'skipped': False,
+                        'retried': True,
+                        'retry_success': retry_success
+                    }
+                    
         except Exception as e:
-            return {
-                'url': target['url'],
-                'status': None,
-                'success': False,
-                'skipped': False,
-                'error': str(e)
-            }
+            # 发生异常，尝试重试
+            try:
+                logging.error(f"Webhook转发异常，3秒后重试 | URL: {PrivacyUtils.sanitize_url(target['url'])} | 错误: {str(e)}")
+                await asyncio.sleep(3)
+                
+                # 重试
+                async with session.post(
+                        target['url'],
+                        data=body,
+                        headers=headers,
+                        timeout=timeout
+                ) as retry_response:
+                    retry_success = 200 <= retry_response.status < 300
+                    return {
+                        'url': target['url'],
+                        'status': retry_response.status,
+                        'success': retry_success,
+                        'skipped': False,
+                        'retried': True,
+                        'retry_success': retry_success,
+                        'retry_after_error': True
+                    }
+            except Exception as retry_e:
+                return {
+                    'url': target['url'],
+                    'status': None,
+                    'success': False,
+                    'skipped': False,
+                    'error': str(retry_e),
+                    'retried': True,
+                    'retry_success': False
+                }
 
     async with aiohttp.ClientSession() as session:
         tasks = [
@@ -846,6 +895,8 @@ async def handle_webhook(
             # 记录转发结果
             success_count = 0
             fail_count = 0
+            retry_count = 0
+            retry_success_count = 0
 
             for result in forward_results:
                 sanitized_url = PrivacyUtils.sanitize_url(result['url'])
@@ -853,11 +904,21 @@ async def handle_webhook(
                     logging.debug(f"Webhook转发跳过 | URL: {sanitized_url} | 原因: {result.get('reason', '未知')}")
                 elif result['success']:
                     success_count += 1
+                    if result.get('retried', False):
+                        retry_count += 1
+                        retry_success_count += 1
+                        logging.info(f"Webhook转发重试成功 | URL: {sanitized_url} | 状态码: {result['status']}")
                 else:
                     fail_count += 1
-                    logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
+                    if result.get('retried', False):
+                        retry_count += 1
+                        logging.error(f"Webhook转发重试失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
+                    else:
+                        logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
 
             forward_status = f"Webhook转发：成功{success_count}，失败{fail_count}"
+            if retry_count > 0:
+                forward_status += f"，重试{retry_count}次(成功{retry_success_count}次)"
         except Exception as e:
             logging.error(f"Webhook转发处理异常: {e}")
             service_health["error_count"] += 1
