@@ -1,231 +1,245 @@
-from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect
-from fastapi.responses import *
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from cryptography.hazmat.primitives.asymmetric import ed25519
-from datetime import datetime, timedelta
-import logging
-import uvicorn
-import asyncio
-from collections import deque, defaultdict
-import configparser
-import os
-from pathlib import Path
-import re
-from urllib.parse import urlparse
-import psutil
-import platform
-import aiohttp
-from typing import List
-from models import get_session, WebhookStats, ConnectionStats, ensure_tables
-from sqlalchemy import update, func, text
-from contextlib import asynccontextmanager
-import time
-from concurrent.futures import ThreadPoolExecutor
-import threading
-from functools import partial
+"""
+Webhook to WebSocket代理服务
+用于将webhook消息转发到websocket连接
+"""
 
+from fastapi import FastAPI, Request, Header, WebSocket, WebSocketDisconnect, Depends, HTTPException, status, Form, Cookie, Response, Query
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, OAuth2
+from pydantic import BaseModel, Field, validator, field_validator, ValidationError
+from contextlib import asynccontextmanager
+
+# 添加安全相关的模型，用于验证输入数据
+class SystemSettings(BaseModel):
+    log_level: str = Field(..., pattern='^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$')
+    deduplication_ttl: int = Field(..., ge=0, le=3600)
+    raw_content: dict = Field(default_factory=dict)
+
+import asyncio
+import logging
+import os
+import time
+import sys
+import json
+from collections import deque
+from typing import Optional, Dict, List, Any
+from urllib.parse import urlparse
+import jwt  # Using jwt package instead of pyjwt
+from datetime import datetime, timedelta, timezone
+import secrets
+import re
+import hashlib
+import uuid
+import copy
+
+# 允许的HTML标签和属性，用于HTML清理
+ALLOWED_HTML_TAGS = ['h1', 'h2', 'h3', 'p', 'br', 'strong', 'em', 'u', 'ol', 'ul', 'li', 'a', 'span', 'div']
+ALLOWED_HTML_ATTRIBUTES = {
+    'a': ['href', 'title'],
+    'span': ['style'],
+    'div': ['style'],
+}
+
+# 添加当前目录到路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+# 导入JSON库
 try:
     import orjson
-
     json_module = orjson
     JSONDecodeError = orjson.JSONDecodeError
 except ImportError:
     import json
-
     json_module = json
     JSONDecodeError = json.JSONDecodeError
 
-# 线程池用于IO密集型任务
-thread_pool = ThreadPoolExecutor(max_workers=4)
+# 从模块导入功能组件
+from modules.config import config
+from modules.monitoring import watch_config, log_config_changes, monitor_service_health
+from modules.stats import stats_manager
+from modules.user_manager import app_id_manager
+from modules.privacy import PrivacyUtils
+from modules.cache import cache_manager
+from modules.utils import setup_logger, generate_signature
+from modules.connections import (
+    active_connections, send_to_all, handle_ws_message,
+    forward_webhook, send_heartbeat, resend_token_cache, 
+    resend_public_cache, service_health
+)
 
-# 缓存大小配置
-CACHE_CONFIG = {
-    "default_max_messages": 1000,  # 默认每个密钥最大缓存消息数
-    "max_public_messages": 1000,  # 公共队列最大消息数
-    "max_token_messages": 500,  # 每个token队列最大消息数
-    "message_ttl": 300,  # 消息有效期(秒)，5分钟
-    "clean_interval": 120,  # 清理间隔(秒)
-}
+# 设置日志
+logger = setup_logger()
+# 确保日志级别正确
+logging.getLogger().setLevel(logging.INFO)
 
+# JWT相关配置
+JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))  # 使用环境变量或生成随机密钥
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = 60 * 24 * 7  # 7天
 
-# 消息缓存管理器
-class MessageCacheManager:
-    def __init__(self):
-        self.message_cache = {}  # {secret: {"public": deque(), "tokens": {token: deque()}}}
-        self.cache_locks = {}  # {secret: asyncio.Lock()}
-        self.message_id_cache = {}  # {message_id: expiry_timestamp}
-        self.clean_thread = None
-        self.stop_flag = threading.Event()
+# Cookie配置
+COOKIE_NAME = "wh_access_token"
+TEMP_COOKIE_NAME = "wh_temp_session"
+COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7天，以秒为单位
+TEMP_COOKIE_MAX_AGE = 60 * 60 * 3  # 3小时，以秒为单位
 
-    async def get_lock_for_secret(self, secret):
-        """获取特定密钥的锁"""
-        if secret not in self.cache_locks:
-            self.cache_locks[secret] = asyncio.Lock()
-        return self.cache_locks[secret]
+# 安全配置
+# 删除csrf_tokens = {}  # 用于存储CSRF令牌
 
-    def start_cleaning_thread(self):
-        """启动清理线程"""
-        if self.clean_thread is None or not self.clean_thread.is_alive():
-            self.stop_flag.clear()
-            self.clean_thread = threading.Thread(target=self._clean_expired_messages)
-            self.clean_thread.daemon = True
-            self.clean_thread.start()
-            logging.info("缓存清理线程已启动")
+# 请求体模型
+class Payload(BaseModel):
+    d: dict
 
-    def stop_cleaning_thread(self):
-        """停止清理线程"""
-        if self.clean_thread and self.clean_thread.is_alive():
-            self.stop_flag.set()
-            self.clean_thread.join(timeout=2)
-            logging.info("缓存清理线程已停止")
-
-    def _clean_expired_messages(self):
-        """清理过期消息线程"""
-        while not self.stop_flag.is_set():
-            try:
-                # 清理message_id缓存
-                now = datetime.now()
-                expired_ids = [msg_id for msg_id, expiry in self.message_id_cache.items() if expiry < now]
-                for msg_id in expired_ids:
-                    self.message_id_cache.pop(msg_id, None)
-
-                if expired_ids:
-                    logging.debug(f"清理过期消息ID: {len(expired_ids)}个")
-
-                # 清理消息缓存
-                for secret in list(self.message_cache.keys()):
-                    try:
-                        cache = self.message_cache[secret]
-
-                        # 清理公共缓存
-                        if "public" in cache:
-                            before_count = len(cache["public"])
-                            cache["public"] = deque(
-                                [(exp, data) for exp, data in cache["public"] if exp > now],
-                                maxlen=cache["public"].maxlen
-                            )
-                            after_count = len(cache["public"])
-                            if before_count > after_count:
-                                logging.debug(
-                                    f"清理公共缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 清理:{before_count - after_count}个")
-
-                        # 清理token缓存
-                        empty_tokens = []
-                        for token, queue in cache.get("tokens", {}).items():
-                            before_count = len(queue)
-                            cache["tokens"][token] = deque(
-                                [(exp, data) for exp, data in queue if exp > now],
-                                maxlen=queue.maxlen
-                            )
-                            after_count = len(cache["tokens"][token])
-
-                            # 如果队列为空，标记为删除
-                            if after_count == 0:
-                                empty_tokens.append(token)
-                            elif before_count > after_count:
-                                logging.debug(
-                                    f"清理Token缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)} | 清理:{before_count - after_count}个")
-
-                        # 删除空队列
-                        for token in empty_tokens:
-                            del cache["tokens"][token]
-
-                        # 如果密钥下没有任何缓存，删除该密钥
-                        if (not cache.get("public") or len(cache["public"]) == 0) and len(cache.get("tokens", {})) == 0:
-                            del self.message_cache[secret]
-                            if secret in self.cache_locks:
-                                del self.cache_locks[secret]
-                            logging.debug(f"删除空缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
-
-                    except Exception as e:
-                        logging.error(f"清理密钥{PrivacyUtils.sanitize_secret(secret)}缓存异常: {e}")
-
-                # 等待下一次清理
-                for _ in range(int(CACHE_CONFIG["clean_interval"] / 0.5)):
-                    if self.stop_flag.is_set():
-                        break
-                    time.sleep(0.5)
-
-            except Exception as e:
-                logging.error(f"缓存清理线程异常: {e}")
-                time.sleep(30)  # 出错后延长等待时间
-
-    async def add_message(self, secret, message_bytes, token=None):
-        """添加消息到缓存"""
-        lock = await self.get_lock_for_secret(secret)
-        async with lock:
-            now = datetime.now()
-            expiry = now + timedelta(seconds=CACHE_CONFIG["message_ttl"])
-
-            # 初始化缓存结构
-            if secret not in self.message_cache:
-                self.message_cache[secret] = {
-                    "public": deque(maxlen=CACHE_CONFIG["max_public_messages"]),
-                    "tokens": {}
-                }
-
-            # 添加到公共缓存
-            if token is None:
-                self.message_cache[secret]["public"].append((expiry, message_bytes))
-                return True
-
-            # 添加到Token缓存
-            if token not in self.message_cache[secret]["tokens"]:
-                self.message_cache[secret]["tokens"][token] = deque(maxlen=CACHE_CONFIG["max_token_messages"])
-
-            self.message_cache[secret]["tokens"][token].append((expiry, message_bytes))
-            return True
-
-    async def get_messages_for_token(self, secret, token):
-        """获取指定token的消息，并清空缓存"""
-        lock = await self.get_lock_for_secret(secret)
-        async with lock:
-            if secret not in self.message_cache or token not in self.message_cache[secret]["tokens"]:
-                return []
-
-            messages = list(self.message_cache[secret]["tokens"][token])
-            self.message_cache[secret]["tokens"][token].clear()
-            return messages
-
-    async def get_public_messages(self, secret):
-        """获取公共消息，并清空缓存"""
-        lock = await self.get_lock_for_secret(secret)
-        async with lock:
-            if secret not in self.message_cache or "public" not in self.message_cache[secret]:
-                return []
-
-            messages = list(self.message_cache[secret]["public"])
-            self.message_cache[secret]["public"].clear()
-            return messages
-
-    def add_message_id(self, message_id, ttl=None):
-        """添加消息ID到去重缓存"""
-        if not ttl:
-            ttl = CACHE_CONFIG["message_ttl"]
-        self.message_id_cache[message_id] = datetime.now() + timedelta(seconds=ttl)
-
-    def has_message_id(self, message_id):
-        """检查消息ID是否存在"""
-        return message_id in self.message_id_cache
+# 用户相关模型
 
 
-# 创建缓存管理器
-cache_manager = MessageCacheManager()
 
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class AppIdCreate(BaseModel):
+    appid: str
+    secret: str
+    description: str = ""
+
+class AppIdResponse(BaseModel):
+    appid: str
+    secret: str
+    description: str
+    create_time: float
+    status: str
+
+
+
+# 创建OAuth2密码流（对于API用）
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+# 安全相关函数
+# 删除generate_csrf_token函数
+
+# JWT相关函数
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expires = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    to_encode.update({"exp": expires, "iat": datetime.now(timezone.utc)})
+    encoded_jwt = jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str) -> Optional[str]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            return None
+        return username
+    except Exception as e:
+        # Handle JWT exceptions as a general exception
+        if 'jwt' in str(e).lower():
+            logging.warning(f"JWT verification failed: {str(e)}")
+        return None
+
+# 用户认证依赖项
+async def get_current_user_from_token(token: str = Depends(oauth2_scheme)) -> str:
+    """从Bearer令牌获取当前用户（API使用）"""
+    username = verify_token(token)
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的身份验证凭据",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return username
+
+async def get_current_user_from_cookie(request: Request) -> Optional[str]:
+    """从Cookie获取当前用户（网页使用）"""
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return None
+    return verify_token(token)
+
+async def get_current_user(
+    request: Request,
+    token: str = Depends(oauth2_scheme)
+) -> str:
+    """综合Cookie和Bearer令牌获取当前用户"""
+    # 先尝试从Bearer令牌获取
+    try:
+        return await get_current_user_from_token(token)
+    except Exception as e:
+        # 如果失败，尝试从Cookie获取
+        username = await get_current_user_from_cookie(request)
+        if not username:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="未登录或会话已过期",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return username
+
+# 管理员身份验证
+async def get_current_admin(request: Request = None, token: str = Depends(oauth2_scheme)) -> str:
+    """验证管理员身份"""
+    # 先尝试从Bearer令牌获取
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        is_admin = payload.get("is_admin", False)
+        
+        if not username or not is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="无效的管理员凭据",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # 管理员用户名固定为admin，无需验证配置中的用户名
+        if username != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="无管理员权限",
+            )
+            
+        return username
+    except Exception as e:
+        # 如果从请求中获取，也要检查是否为管理员
+        if request:
+            token = request.cookies.get(COOKIE_NAME)
+            if token:
+                try:
+                    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                    username = payload.get("sub")
+                    is_admin = payload.get("is_admin", False)
+                    
+                    if username and is_admin and username == "admin":
+                        return username
+                except Exception:
+                    logging.warning("从cookie解析管理员令牌失败")
+                    pass
+        
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="需要管理员权限",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
     # 启动配置监控任务
     config_task = asyncio.create_task(watch_config())
     # 启动健康监控任务
     health_task = asyncio.create_task(monitor_service_health())
-    # 确保数据库表已创建
-    await ensure_tables()
     # 启动缓存清理线程
     cache_manager.start_cleaning_thread()
+    # 启动统计信息写入线程
+    stats_manager.start_write_thread()
 
-    logging.info(f"服务已启动")
+    logger.info(f"服务已启动 - 监听端口: {config.port}")
 
     yield
 
@@ -234,16 +248,22 @@ async def lifespan(app: FastAPI):
     health_task.cancel()
     # 停止缓存清理线程
     cache_manager.stop_cleaning_thread()
+    # 停止统计信息写入线程
+    stats_manager.stop_write_thread()
 
     try:
         await config_task
         await health_task
     except asyncio.CancelledError:
         pass
-    logging.info(f"服务已停止")
+    logger.info("服务已停止")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan,
+    # 设置日志级别为INFO，以便显示WebSocket连接和消息转发日志
+    log_level="info"
+)
 
 # 跨域配置
 app.add_middleware(
@@ -254,559 +274,228 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 确保web目录存在
+os.makedirs("web", exist_ok=True)
+os.makedirs("web/js", exist_ok=True)
+os.makedirs("web/css", exist_ok=True)
 
-class PrivacyUtils:
-    @staticmethod
-    def sanitize_ip(ip: str) -> str:
-        """IP地址脱敏处理"""
-        if not ip or ip == "unknown":
-            return "unknown"
-        ip_parts = ip.split('.')
-        if len(ip_parts) == 4:  # IPv4地址处理
-            return f"{ip_parts[0]}.***.***.{ip_parts[3]}"
-        return ip
+# 提供静态文件服务
+app.mount("/static", StaticFiles(directory="web"), name="static") 
 
-    @staticmethod
-    def sanitize_secret(secret: str) -> str:
-        """密钥脱敏处理"""
-        if not secret:
-            return "****"
-        if len(secret) <= 6:
-            return "****"
-        return f"{secret[:3]}****{secret[-3:]}"
+# 用户面板路由
+@app.get("/console", response_class=HTMLResponse)
+async def user_console(request: Request):
+    """返回用户面板HTML页面 - 重定向至新的统一控制台"""
+    # 检查用户是否已登录
+    username = await get_current_user_from_cookie(request)
+    if not username:
+        # 用户未登录，重定向到统一登录页
+        return RedirectResponse(url="/login")
+    
+    # 已登录用户重定向到控制台
+    return FileResponse("web/console.html")
 
-    @staticmethod
-    def sanitize_url(url: str) -> str:
-        """URL脱敏处理"""
-        try:
-            parsed = urlparse(url)
-            # 处理域名部分
-            netloc = parsed.netloc
-            if ':' in netloc:
-                host, port = netloc.split(':')
-                host = PrivacyUtils.sanitize_ip(host)
-                netloc = f"{host}:{port}"
-            else:
-                netloc = PrivacyUtils.sanitize_ip(netloc)
+# 管理员面板路由
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(request: Request):
+    """返回管理员面板HTML页面 - 重定向至新的统一控制台"""
+    if not config.admin.get("enabled", True):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="管理员功能已禁用"
+        )
+    
+    # 检查管理员是否已登录
+    try:
+        admin = await get_current_admin(request)
+        # 已登录管理员重定向到控制台
+        return RedirectResponse(url="/console")
+    except HTTPException:
+        # 管理员未登录，重定向到登录页面（包含token）
+        return RedirectResponse(url=f"/login?token={config.access_token}")
 
-            # 处理查询参数中的密钥
-            query = parsed.query
-            if query:
-                query_params = dict(param.split('=') for param in query.split('&') if '=' in param)
-                if 'secret' in query_params:
-                    query_params['secret'] = PrivacyUtils.sanitize_secret(query_params['secret'])
-                query = '&'.join(f"{k}={v}" for k, v in query_params.items())
+# 重定向根目录到登录页面
+@app.get("/", response_class=HTMLResponse)
+async def root_redirect():
+    """主页重定向到管理员登录页面"""
+    return RedirectResponse(url=f"/login?token={config.access_token}")
 
-            # 重建URL
-            sanitized = parsed._replace(netloc=netloc, query=query)
-            return sanitized.geturl()
-        except Exception as e:
-            logging.error(f"URL脱敏处理失败: {str(e)}")
-            return "***"
+# 新的统一登录/注册页面
+@app.get("/login", response_class=HTMLResponse)
+async def unified_login_page(request: Request, token: str = Query(None)):
+    """返回统一登录和注册页面，需要token验证"""
+    # 二层验证：检查访问token
+    if not token or token != config.access_token:
+        return Response(status_code=403)
+    
+    # 检查用户是否已登录
+    username = await get_current_user_from_cookie(request)
+    if username:
+        # 检查是否来自console页面的重定向，避免循环重定向
+        referer = request.headers.get("referer", "")
+        if "/console" in referer:
+            # 来自控制台的请求，直接返回登录页面而不是重定向
+            return FileResponse("web/login.html")
+        # 用户已登录，重定向到控制台
+        return RedirectResponse(url="/console")
+    
+    # 直接返回登录页面
+    return FileResponse("web/login.html")
 
-    @staticmethod
-    def sanitize_path(path: str) -> str:
-        """URL路径脱敏处理"""
-        return re.sub(
-            r"(secret=)(\w{3})\w+",
-            r"\1\2****",
-            path,
-            flags=re.IGNORECASE
+# 获取临时会话
+def get_temp_session_id(request: Request) -> str:
+    """获取临时会话ID"""
+    # 从cookie中获取会话ID（优先使用新的wh_temp_session，兼容旧的session_id）
+    session_id = request.cookies.get(TEMP_COOKIE_NAME) or request.cookies.get("session_id")
+    
+    # 如果用户已登录，使用特殊会话ID
+    if not session_id and request.cookies.get(COOKIE_NAME):
+        logging.debug("用户已登录，使用特殊临时会话ID")
+        return "logged_in_user"
+    
+    # 如果没有会话ID，生成一个简单的随机ID
+    if not session_id:
+        import secrets
+        session_id = secrets.token_hex(16)
+    
+    return session_id
+
+# 发送验证码API
+# 已删除 - 邮箱验证码功能不再提供
+    """发送验证码"""
+    return JSONResponse({
+        "status": "error",
+        "message": "邮箱验证码功能已被移除"
+    }, status_code=410)
+
+# 已删除 - 用户注册功能不再提供
+    """用户注册处理"""
+    return JSONResponse({
+        "status": "error",
+        "message": "注册功能已被移除"
+    }, status_code=403)
+
+
+    """
+    用户登录API
+    使用表单数据进行登录验证，成功后返回访问令牌并设置cookie
+    """
+    try:
+        username = form_data.username
+        password = form_data.password
+        
+        logging.info(f"用户尝试登录: {username}")
+        
+        # 验证用户凭据
+        if not app_id_manager.authenticate(username, password):
+            logging.warning(f"登录失败: {username} - 用户名或密码错误")
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "用户名或密码错误"}
+            )
+        
+        # 生成访问令牌
+        access_token = create_access_token(data={"sub": username})
+        
+        # 设置cookie - 默认启用"记住我"功能
+        response.set_cookie(
+            key=COOKIE_NAME,
+            value=access_token,
+            httponly=True,
+            max_age=COOKIE_MAX_AGE,  # 7天有效期
+            samesite="lax"  # 添加SameSite属性
+        )
+        
+        logging.info(f"用户登录成功: {username}")
+        # 返回令牌
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except Exception as e:
+        logging.error(f"登录处理过程发生错误: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="服务器内部错误，请稍后重试"
         )
 
 
-# 隐私保护中间件
-@app.middleware("http")
-async def privacy_middleware(request: Request, call_next):
-    response = await call_next(request)
-
-    # IP地址脱敏处理
-    client_host = request.client.host if request.client else "unknown"
-    sanitized_ip = PrivacyUtils.sanitize_ip(client_host)
-
-    # URL路径处理
-    full_url = str(request.url)
-    parsed_url = urlparse(full_url)
-    sanitized_path = parsed_url.path
-    if parsed_url.query:
-        sanitized_path += "?" + parsed_url.query
-
-    # 敏感参数过滤
-    sanitized_path = PrivacyUtils.sanitize_path(sanitized_path)
-
-    # 构建安全日志
-    log_message = (
-        f'{sanitized_ip}:{request.client.port if request.client else 0} - '
-        f'"{request.method} {sanitized_path} HTTP/{request.scope["http_version"]}" '
-        f'{response.status_code}'
-    )
-
-    logger.info(log_message)
-
-    return response
-
-
-# 存储结构
-active_connections = {}  # {secret: {websocket: {"token": str, ...}}}
-message_cache = {}  # {secret: {"public": deque(), "tokens": {token: deque()}}}
-cache_locks = {}  # {secret: asyncio.Lock()} - 细化锁粒度，每个密钥一个锁
-message_id_cache = {}  # {message_id: expiry_timestamp}
-
-
-# 日志配置
-def load_log_config():
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='UTF-8')
-    log_level = config.get('DEFAULT', 'log', fallback='INFO').upper()
-    if log_level == "TESTING":
-        log_level = "DEBUG"
-    return log_level
-
-
-# 加载消息去重配置
-def load_deduplication_config():
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='UTF-8')
-    return config.getint('DEFAULT', 'deduplication_ttl', fallback=20)
-
-
-# 加载原始内容记录配置
-def load_raw_content_config():
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='UTF-8')
-    return {
-        'enabled': config.getboolean('DEFAULT', 'save_raw_content', fallback=False),
-        'path': config.get('DEFAULT', 'raw_content_path', fallback='logs')
-    }
-
-
-# 加载不缓存的密钥列表
-def load_no_cache_secrets():
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='UTF-8')
-    no_cache_secrets = config.get('DEFAULT', 'no_cache_secrets', fallback='').strip()
-    if not no_cache_secrets:
-        return []
-    return [secret.strip() for secret in no_cache_secrets.split(',')]
-
-
-# 初始化日志
-log_level = load_log_config()
-logging.basicConfig(
-    level=log_level,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger()
-
-
-# 签名生成函数
-def generate_signature(bot_secret, event_ts, plain_token):
-    while len(bot_secret) < 32:
-        bot_secret = (bot_secret + bot_secret)[:32]
-
-    private_key = ed25519.Ed25519PrivateKey.from_private_bytes(bot_secret.encode())
-    message = f"{event_ts}{plain_token}".encode()
-    signature = private_key.sign(message).hex()
-
-    return {
-        "plain_token": plain_token,
-        "signature": signature
-    }
-
-
-class Payload(BaseModel):
-    d: dict
-
-
-# 统计数据结构
-connection_stats = {
-    "history_connections": defaultdict(int),  # 历史连接数
-    "webhook_forwards": defaultdict(lambda: {"count": 0, "urls": set(), "total_bytes": 0}),  # webhook转发统计
-    "active_keys": set(),  # 活跃密钥
-}
-
-
-def get_system_stats():
-    """获取系统资源使用情况"""
-    process = psutil.Process(os.getpid())
-
-    # CPU使用率
-    cpu_percent = process.cpu_percent(interval=0.1)
-
-    # 内存使用
-    memory_info = process.memory_info()
-    memory_percent = process.memory_percent()
-
-    # 系统信息
-    system_info = {
-        "platform": platform.system(),
-        "platform_version": platform.version(),
-        "python_version": platform.python_version(),
-        "cpu_count": psutil.cpu_count(),
-        "total_memory": psutil.virtual_memory().total,
-    }
-
-    return {
-        "cpu_percent": round(cpu_percent, 1),
-        "memory_used": memory_info.rss,  # 实际使用的物理内存
-        "memory_percent": round(memory_percent, 1),
-        "system_info": system_info
-    }
-
-
-async def update_webhook_stats(secret: str, url: str, bytes_count: int):
-    """更新webhook统计数据"""
+    """
+    用户注销API
+    清除用户session和cookie
+    """
     try:
-        async with await get_session() as session:
-            async with session.begin():
-                stats = (await session.execute(
-                    text("SELECT * FROM webhook_stats WHERE secret = :secret AND url = :url"),
-                    {"secret": secret, "url": url}
-                )).first()
-
-                if stats:
-                    await session.execute(
-                        text(
-                            "UPDATE webhook_stats SET count = count + 1, total_bytes = total_bytes + :bytes, last_updated = :now WHERE secret = :secret AND url = :url"),
-                        {"bytes": bytes_count, "now": datetime.now(), "secret": secret, "url": url}
-                    )
-                else:
-                    await session.execute(
-                        text(
-                            "INSERT INTO webhook_stats (secret, url, count, total_bytes, last_updated) VALUES (:secret, :url, 1, :bytes, :now)"),
-                        {"secret": secret, "url": url, "bytes": bytes_count, "now": datetime.now()}
-                    )
+        # 清除访问令牌cookie
+        response.delete_cookie(key=COOKIE_NAME)
+    
+        # 清除临时会话cookie（如果有）
+        response.delete_cookie(key=TEMP_COOKIE_NAME)
+        
+        # 清除旧的session_id（如果有）
+        response.delete_cookie(key="session_id")
+    
+        return {"status": "success", "message": "已成功注销"}
+        
     except Exception as e:
-        logging.error(f"更新webhook统计失败: {e}")
+        logging.error(f"注销处理过程发生错误: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "注销失败，请稍后重试"}
+        )
 
-
-async def update_connection_stats(secret: str, is_active: bool = True):
-    """更新连接统计数据"""
+# 管理员登录API
+@app.post("/api/admin/login")
+async def admin_login(response: Response, admin_data: Dict[str, Any]):
+    """管理员登录
+    
+    只需要验证密码，无需用户名
+    """
     try:
-        async with await get_session() as session:
-            async with session.begin():
-                stats = (await session.execute(
-                    text("SELECT * FROM connection_stats WHERE secret = :secret"),
-                    {"secret": secret}
-                )).first()
-
-                if stats:
-                    if is_active:
-                        await session.execute(
-                            text(
-                                "UPDATE connection_stats SET history_connections = history_connections + 1, is_active = 1, last_updated = :now WHERE secret = :secret"),
-                            {"now": datetime.now(), "secret": secret}
-                        )
-                    else:
-                        await session.execute(
-                            text(
-                                "UPDATE connection_stats SET is_active = 0, last_updated = :now WHERE secret = :secret"),
-                            {"now": datetime.now(), "secret": secret}
-                        )
-                else:
-                    await session.execute(
-                        text(
-                            "INSERT INTO connection_stats (secret, history_connections, is_active, last_updated) VALUES (:secret, :history, :active, :now)"),
-                        {"secret": secret, "history": 1 if is_active else 0, "active": 1 if is_active else 0,
-                         "now": datetime.now()}
-                    )
+        # 记录登录尝试
+        logging.info("管理员登录尝试")
+        
+        # 验证请求数据
+        if not isinstance(admin_data, dict):
+            logging.error("管理员登录错误: 无效的请求数据格式")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="无效的请求数据格式"
+            )
+        
+        password = admin_data.get("password", "")
+    
+        # 验证管理员密码
+        stored_password = config.admin.get("password")
+        if not stored_password or stored_password != password:
+            logging.warning("管理员登录失败: 密码错误")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="管理员密码错误"
+            )
+    
+        # 生成访问令牌，包含管理员标记（固定用户名为admin）
+        access_token = create_access_token(data={"sub": "admin", "is_admin": True})
+        logging.info("管理员登录成功")
+    
+        # 设置cookie
+        response.set_cookie(
+            key=COOKIE_NAME,
+            value=access_token,
+            httponly=True,
+            max_age=COOKIE_MAX_AGE,  # 7天有效期
+            samesite="lax"  # 添加SameSite属性
+        )
+    
+        # 返回令牌
+        return {"access_token": access_token, "token_type": "bearer"}
+    except HTTPException:
+        # 直接重新抛出HTTP异常
+        raise
     except Exception as e:
-        logging.error(f"更新连接统计失败: {e}")
-
-
-@app.get("/logs")
-async def logs_page():
-    return FileResponse("logs.html")
-
-
-# 获取特定密钥的锁
-async def get_lock_for_secret(secret):
-    return await cache_manager.get_lock_for_secret(secret)
-
-
-@app.get("/api/stats")
-async def get_stats():
-    try:
-        async with await get_session() as session:
-            # 获取在线连接信息
-            online_connections = []
-            total_online = 0
-
-            for secret, connections in active_connections.items():
-                for ws, info in connections.items():
-                    total_online += 1
-                    online_connections.append({
-                        "secret": f"{secret[:3]}****",
-                        "token": f"{info['token'][:3]}****" if info.get('token') else None,
-                        "environment": "沙盒环境" if info.get('is_sandbox') else "正式环境",
-                        "type": "常驻连接" if info.get('token') else "临时连接"
-                    })
-
-            # 获取webhook转发信息
-            webhook_stats_result = await session.execute(text("SELECT * FROM webhook_stats"))
-            webhook_stats = webhook_stats_result.fetchall()
-            webhook_forwards = []
-            total_webhooks = 0
-            total_bytes = 0
-
-            for stats in webhook_stats:
-                total_webhooks += stats.count
-                total_bytes += stats.total_bytes
-
-                parsed_url = urlparse(stats.url)
-                domain = parsed_url.netloc.split('.')
-                if len(domain) >= 2:
-                    domain = f"{domain[0]}.{domain[1]}"
-                else:
-                    domain = parsed_url.netloc
-
-                webhook_forwards.append({
-                    "secret": f"{stats.secret[:3]}****",
-                    "url": f"{domain}...",
-                    "count": stats.count,
-                    "total_bytes": stats.total_bytes
-                })
-
-            # 获取历史连接总数
-            history_count_result = await session.execute(text("SELECT SUM(history_connections) FROM connection_stats"))
-            history_count = history_count_result.scalar() or 0
-
-            # 获取活跃密钥数
-            active_keys_result = await session.execute(
-                text("SELECT COUNT(*) FROM connection_stats WHERE is_active = 1"))
-            active_keys = active_keys_result.scalar()
-
-            # 获取系统资源使用情况
-            system_stats = get_system_stats()
-
-            return {
-                "online_count": total_online,
-                "history_count": history_count,
-                "webhook_count": total_webhooks,
-                "webhook_total_bytes": total_bytes,
-                "active_keys": active_keys,
-                "online_connections": online_connections,
-                "webhook_forwards": webhook_forwards,
-                "system_stats": system_stats
-            }
-    except Exception as e:
-        logging.error(f"获取统计数据失败: {e}")
-        return {"error": "获取统计数据失败"}
-
-
-def load_webhook_config() -> dict:
-    config = configparser.ConfigParser()
-    config.read('config.ini', encoding='UTF-8')
-
-    # 解析目标URL和对应的密钥
-    targets_config = config.get('WEBHOOK_FORWARD', 'targets', fallback='')
-    targets = []
-    for url in targets_config.split(','):
-        url = url.strip()
-        if not url:
-            continue
-
-        # 解析URL中的secret参数
-        parsed_url = urlparse(url)
-        query_params = dict(param.split('=') for param in parsed_url.query.split('&') if '=' in param)
-        target_secret = query_params.get('secret')
-
-        if target_secret:
-            targets.append({
-                'url': url,
-                'secret': target_secret
-            })
-
-    return {
-        'enabled': config.getboolean('WEBHOOK_FORWARD', 'enabled', fallback=False),
-        'targets': targets,
-        'timeout': config.getint('WEBHOOK_FORWARD', 'timeout', fallback=5)
-    }
-
-
-async def forward_webhook(
-        targets: List[dict],
-        body: bytes,
-        headers: dict,
-        timeout: int,
-        current_secret: str
-) -> list:
-    async def send_to_target(session: aiohttp.ClientSession, target: dict) -> dict:
-        # 只转发给匹配密钥的目标
-        if target['secret'] != current_secret:
-            return {
-                'url': target['url'],
-                'status': None,
-                'success': True,
-                'skipped': True,
-                'reason': '密钥不匹配'
-            }
-
-        try:
-            async with session.post(
-                    target['url'],
-                    data=body,
-                    headers=headers,
-                    timeout=timeout
-            ) as response:
-                success = 200 <= response.status < 300
-                result = {
-                    'url': target['url'],
-                    'status': response.status,
-                    'success': success,
-                    'skipped': False,
-                    'retry': False
-                }
-                
-                # 如果请求失败，进行一次重试
-                if not success:
-                    logging.warning(f"Webhook转发失败，3秒后重试: {target['url']}")
-                    await asyncio.sleep(3)  # 等待3秒后重试
-                    try:
-                        async with session.post(
-                                target['url'],
-                                data=body,
-                                headers=headers,
-                                timeout=timeout
-                        ) as retry_response:
-                            retry_success = 200 <= retry_response.status < 300
-                            if retry_success:
-                                result = {
-                                    'url': target['url'],
-                                    'status': retry_response.status,
-                                    'success': True,
-                                    'skipped': False,
-                                    'retry': True
-                                }
-                                logging.info(f"Webhook重试转发成功: {target['url']}")
-                            else:
-                                result['retry'] = True
-                    except Exception as retry_e:
-                        logging.error(f"Webhook重试转发异常: {str(retry_e)}")
-                        result['retry'] = True
-                        result['retry_error'] = str(retry_e)
-                
-                return result
-        except Exception as e:
-            logging.error(f"Webhook首次转发异常: {str(e)}")
-            # 发生异常，进行重试
-            await asyncio.sleep(3)  # 等待3秒后重试
-            try:
-                async with session.post(
-                        target['url'],
-                        data=body,
-                        headers=headers,
-                        timeout=timeout
-                ) as retry_response:
-                    retry_success = 200 <= retry_response.status < 300
-                    return {
-                        'url': target['url'],
-                        'status': retry_response.status,
-                        'success': retry_success,
-                        'skipped': False,
-                        'retry': True
-                    }
-            except Exception as retry_e:
-                return {
-                    'url': target['url'],
-                    'status': None,
-                    'success': False,
-                    'skipped': False,
-                    'error': str(e),
-                    'retry': True,
-                    'retry_error': str(retry_e)
-                }
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            send_to_target(session, target)
-            for target in targets
-        ]
-        results = await asyncio.gather(*tasks)
-        return results
-
-
-# 添加服务健康状态监控
-service_health = {
-    "last_successful_webhook": 0,
-    "last_successful_ws_message": 0,
-    "restart_count": 0,
-    "error_count": 0,
-    "high_load_detected": False
-}
-
-
-# 监控和自动修复
-async def monitor_service_health():
-    """监控服务健康状态并尝试自动修复"""
-    while True:
-        try:
-            now = time.time()
-            # 检查webhook处理
-            if service_health["last_successful_webhook"] > 0:
-                webhook_idle_time = now - service_health["last_successful_webhook"]
-                if webhook_idle_time > 300:  # 5分钟没有成功处理webhook
-                    logging.warning(f"检测到webhook处理异常，{webhook_idle_time:.1f}秒未成功处理")
-
-                    # 检查连接数量
-                    total_connections = sum(len(conns) for conns in active_connections.values())
-                    if total_connections == 0 and service_health["error_count"] > 10:
-                        # 清理资源并重置状态
-                        logging.warning("执行自动恢复: 清理缓存和锁")
-                        cache_locks.clear()
-                        message_cache.clear()
-                        message_id_cache.clear()
-                        service_health["restart_count"] += 1
-                        service_health["error_count"] = 0
-
-            # 检查系统负载
-            cpu_percent = psutil.cpu_percent(interval=0.5)
-            if cpu_percent > 90:  # CPU使用率超过90%
-                if not service_health["high_load_detected"]:
-                    logging.warning(f"检测到高CPU负载: {cpu_percent}%，尝试释放资源")
-                    service_health["high_load_detected"] = True
-
-                # 清理过期消息缓存
-                for secret in list(message_cache.keys()):
-                    try:
-                        lock = await get_lock_for_secret(secret)
-                        if lock.locked():
-                            continue  # 跳过正在使用的缓存
-
-                        async with lock:
-                            # 清理公共缓存
-                            now_dt = datetime.now()
-                            if "public" in message_cache[secret]:
-                                message_cache[secret]["public"] = deque(
-                                    [(exp, data) for exp, data in message_cache[secret]["public"] if exp > now_dt],
-                                    maxlen=message_cache[secret]["public"].maxlen
-                                )
-
-                            # 清理token缓存
-                            for token in list(message_cache[secret].get("tokens", {}).keys()):
-                                token_queue = message_cache[secret]["tokens"][token]
-                                message_cache[secret]["tokens"][token] = deque(
-                                    [(exp, data) for exp, data in token_queue if exp > now_dt],
-                                    maxlen=token_queue.maxlen
-                                )
-                    except Exception as e:
-                        logging.error(f"清理缓存异常: {e}")
-            else:
-                service_health["high_load_detected"] = False
-
-            # 监控内存使用
-            memory_percent = psutil.Process().memory_percent()
-            if memory_percent > 85:  # 内存使用超过85%
-                logging.warning(f"检测到高内存使用: {memory_percent:.1f}%，执行垃圾回收")
-                import gc
-                gc.collect()
-
-            await asyncio.sleep(30)  # 每30秒检查一次
-        except Exception as e:
-            logging.error(f"健康监控异常: {e}")
-            await asyncio.sleep(60)  # 出错后等待时间延长
-
+        # 记录详细错误信息
+        logging.error(f"管理员登录过程中发生未处理的异常: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="服务器内部错误"
+        )
 
 @app.post("/webhook")
 async def handle_webhook(
@@ -815,10 +504,72 @@ async def handle_webhook(
         user_agent: str = Header(None),
         x_bot_appid: str = Header(None)
 ):
+    """处理Webhook请求入口"""
     start_time = time.time()
     secret = request.query_params.get('secret')
     body_bytes = await request.body()
-    logging.debug(f"收到原始消息: {body_bytes}")
+    
+    # 原始消息记录功能
+    if hasattr(config, 'raw_content') and config.raw_content.get('enabled', False):
+        try:
+            import os
+            from datetime import datetime
+            
+            # 确保日志目录存在
+            log_dir = config.raw_content.get('path', 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            
+            # 生成日志文件名（按日期分文件）
+            current_date = datetime.now().strftime('%Y-%m-%d')
+            log_file = os.path.join(log_dir, f'raw_messages_{current_date}.log')
+            
+            # 记录原始消息
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            client_ip = request.client.host if request.client else "unknown"
+            
+            # 尝试解析原始消息体为JSON，避免双重转义
+            try:
+                raw_body_str = body_bytes.decode('utf-8', errors='ignore')
+                if raw_body_str.strip():
+                    # 尝试解析为JSON对象
+                    if json_module.__name__ == 'orjson':
+                        raw_body = json_module.loads(raw_body_str.encode('utf-8'))
+                    else:
+                        raw_body = json_module.loads(raw_body_str)
+                else:
+                    raw_body = raw_body_str
+            except Exception as parse_error:
+                # 如果不是有效JSON，则存储原始字符串
+                logging.debug(f"原始消息不是有效JSON，存储为字符串: {str(parse_error)}")
+                raw_body = body_bytes.decode('utf-8', errors='ignore')
+            
+            log_entry = {
+                'timestamp': timestamp,
+                'client_ip': client_ip,
+                'secret': secret,
+                'user_agent': user_agent,
+                'x_bot_appid': x_bot_appid,
+                'content_length': len(body_bytes),
+                'raw_body': raw_body
+            }
+            
+            # 写入日志文件，根据JSON库选择合适的序列化方法
+            with open(log_file, 'a', encoding='utf-8') as f:
+                if json_module.__name__ == 'orjson':
+                    # orjson不支持ensure_ascii参数，但默认就是UTF-8输出
+                    json_str = json_module.dumps(log_entry).decode('utf-8')
+                else:
+                    # 标准json库
+                    json_str = json_module.dumps(log_entry, ensure_ascii=False)
+                f.write(f"{json_str}\n")
+                
+            logging.debug(f"原始消息已记录到: {log_file}")
+            
+        except Exception as e:
+            logging.error(f"记录原始消息失败: {str(e)}")
+
+    # 增加消息总数统计
+    stats_manager.increment_message_count()
 
     # 获取客户端IP地址
     client_host = request.client.host if request.client else "unknown"
@@ -831,52 +582,40 @@ async def handle_webhook(
         message_data = json_module.loads(body_bytes)
         message_id = message_data.get('id')
 
-        # 保存原始内容（初始状态）
-        save_raw_content(body_bytes, secret, message_id, "接收", client_ip)
-
         # 如果存在消息ID，检查是否已经处理过
         if message_id:
-            # 获取去重有效期配置
-            deduplication_ttl = load_deduplication_config()
-
             # 检查当前消息是否已存在于缓存中
             if cache_manager.has_message_id(message_id):
-                logging.info(f"检测到重复消息ID，跳过所有处理和转发: {message_id} | IP: {client_ip}")
-                # 更新消息状态
-                save_raw_content(body_bytes, secret, message_id, "重复消息-不转发", client_ip)
                 return {"status": "success"}  # 直接返回，不进行后续任何处理
 
             # 将当前消息ID添加到缓存中，有效期从配置中读取
-            cache_manager.add_message_id(message_id, deduplication_ttl)
-            logging.debug(f"添加消息ID到缓存，有效期{deduplication_ttl}秒: {message_id}")
+            cache_manager.add_message_id(message_id, config.deduplication_ttl)
+            # 移除消息ID缓存日志
     except Exception as e:
         logging.error(f"消息去重处理异常: {str(e)}")
         service_health["error_count"] += 1
-        # 更新消息状态
-        save_raw_content(body_bytes, secret, message_id, "解析异常", client_ip)
 
     # 处理回调验证
     if "event_ts" in payload.d and "plain_token" in payload.d:
         try:
             event_ts = payload.d["event_ts"]
             plain_token = payload.d["plain_token"]
-            # 更新消息状态
-            save_raw_content(body_bytes, secret, message_id, "回调验证", client_ip)
             result = generate_signature(secret, event_ts, plain_token)
             service_health["last_successful_webhook"] = time.time()
             return result
         except Exception as e:
             logging.error(f"签名错误: {e}")
             service_health["error_count"] += 1
-            # 更新消息状态
-            save_raw_content(body_bytes, secret, message_id, "签名错误", client_ip)
             return {"status": "error"}
 
     # 转发状态
     forward_status = "转发状态：未知"
+    
+    # 使用根日志记录器确保消息被处理
+    root_logger = logging.getLogger()
 
     # 处理webhook转发
-    webhook_config = load_webhook_config()
+    webhook_config = config.webhook_forward
     if webhook_config['enabled'] and webhook_config['targets']:
         # 获取原始请求头
         forward_headers = {
@@ -902,37 +641,65 @@ async def handle_webhook(
             for result in forward_results:
                 sanitized_url = PrivacyUtils.sanitize_url(result['url'])
                 if result.get('skipped', False):
-                    logging.debug(f"Webhook转发跳过 | URL: {sanitized_url} | 原因: {result.get('reason', '未知')}")
+                    pass
                 elif result['success']:
                     if result.get('retry', False):
                         retry_success_count += 1
-                        logging.info(f"Webhook重试后转发成功 | URL: {sanitized_url} | 状态码: {result['status']}")
+                        # 保留前台显示的日志
+                        current_time = time.strftime('%m-%d %H:%M:%S')
+                        root_logger.info(f"{current_time} - Webhook重试后转发成功 | URL: {sanitized_url}")
                     else:
                         success_count += 1
-                        logging.info(f"Webhook转发成功 | URL: {sanitized_url} | 状态码: {result['status']}")
+                        # 保留前台显示的日志
+                        current_time = time.strftime('%m-%d %H:%M:%S')
+                        root_logger.info(f"{current_time} - Webhook转发成功 | URL: {sanitized_url}")
                 else:
                     fail_count += 1
                     if result.get('retry', False):
                         retry_error = result.get('retry_error', '未知错误')
-                        logging.error(f"Webhook重试转发失败 | URL: {sanitized_url} | 错误: {retry_error}")
+                        current_time = time.strftime('%m-%d %H:%M:%S')
+                        root_logger.error(f"{current_time} - Webhook重试转发失败 | URL: {sanitized_url} | 错误: {retry_error}")
                     else:
-                        logging.error(f"Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
+                        current_time = time.strftime('%m-%d %H:%M:%S')
+                        root_logger.error(f"{current_time} - Webhook转发失败 | URL: {sanitized_url} | 错误: {result.get('error', '未知错误')}")
 
-            forward_status = f"Webhook转发：首次成功{success_count}，重试成功{retry_success_count}，失败{fail_count}"
+            # 更新Webhook转发统计
+            total_success = success_count + retry_success_count
+            stats_manager.batch_update_wh_stats(secret, total_success, fail_count)
+
+            # 记录总体转发状态，避免同时记录成功和失败日志
+            if total_success > 0:
+                # 至少有一个成功
+                if fail_count > 0:
+                    # 部分成功部分失败
+                    forward_status = f"Webhook转发：部分成功 {total_success}，失败 {fail_count}"
+                    # 只记录部分成功的信息日志，不再记录单独的失败警告
+                    # 保留前台显示的日志
+                    root_logger.info(f"Webhook部分转发成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 成功：{total_success}，失败：{fail_count}")
+                else:
+                    # 全部成功
+                    forward_status = f"Webhook转发：全部成功 {total_success}"
+            else:
+                # 全部失败，但如果没有目标或全部跳过则不记录警告
+                forward_status = f"Webhook转发：全部失败 {fail_count}"
+                
+                # 检查是否有WebSocket连接，如果有则不记录Webhook失败警告
+                has_ws_connections = secret in active_connections and len(active_connections[secret]) > 0
+                
+                # 只有当确实有失败项且没有WebSocket连接时才记录警告
+                if fail_count > 0 and not has_ws_connections:
+                    # 保留error级别日志
+                    root_logger.warning(f"Webhook转发全部失败 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 失败数：{fail_count}/{fail_count}")
+                elif fail_count == 0:
+                    # 如果失败数为0，说明全部被跳过，不需要记录日志
+                    pass
         except Exception as e:
-            logging.error(f"Webhook转发处理异常: {e}")
+            root_logger.error(f"Webhook转发处理异常: {e}")
             service_health["error_count"] += 1
             forward_status = f"Webhook转发异常: {str(e)}"
 
-    # 更新webhook统计
-    if secret:
-        await update_webhook_stats(secret, str(request.url), len(body_bytes))
-
-    # 获取不缓存的密钥列表
-    no_cache_secrets = load_no_cache_secrets()
-
     # 检查当前密钥是否在不缓存列表中
-    skip_cache = secret in no_cache_secrets
+    skip_cache = secret in config.no_cache_secrets
     if skip_cache:
         forward_status += " | 不缓存密钥"
 
@@ -949,22 +716,17 @@ async def handle_webhook(
             forward_status += " | WS：无在线连接-不缓存"
         else:
             forward_status += " | WS：有在线连接"
-    except Exception as e:
-        logging.error(f"消息缓存处理异常: {e}")
-        service_health["error_count"] += 1
-        forward_status += f" | 缓存异常: {str(e)}"
-
-    # 实时转发
-    if has_online:
+            # 只有当确实有WebSocket连接时才尝试转发
         try:
             await send_to_all(secret, body_bytes)
         except Exception as e:
             logging.error(f"实时转发异常: {e}")
             service_health["error_count"] += 1
             forward_status += f" | 转发异常: {str(e)}"
-
-    # 最终更新消息状态
-    save_raw_content(body_bytes, secret, message_id, forward_status, client_ip)
+    except Exception as e:
+        logging.error(f"消息缓存处理异常: {e}")
+        service_health["error_count"] += 1
+        forward_status += f" | 缓存异常: {str(e)}"
 
     # 更新健康状态
     process_time = time.time() - start_time
@@ -974,6 +736,44 @@ async def handle_webhook(
     service_health["last_successful_webhook"] = time.time()
 
     return {"status": "success"}
+
+# 新增短密钥webhook处理端点
+@app.post("/api/{appid}")
+async def handle_appid_webhook(
+        appid: str,
+        request: Request,
+        payload: Payload,
+        user_agent: str = Header(None),
+        x_bot_appid: str = Header(None),
+        signature: str = Query(None),
+        timestamp: str = Query(None),
+        nonce: str = Query(None)
+):
+    """通过AppID处理Webhook请求"""
+    # 根据AppID获取原始密钥
+    secret = app_id_manager.get_secret_by_appid(appid)
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="无效的AppID"
+        )
+    
+    # 验证签名（如果提供了签名参数）
+    if signature and timestamp and nonce:
+        if not app_id_manager.verify_signature(appid, signature, timestamp, nonce):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="签名验证失败"
+            )
+    
+    # 将请求重定向到标准Webhook处理流程
+    request.query_params._dict["secret"] = secret
+    return await handle_webhook(
+        request=request,
+        payload=payload,
+        user_agent=user_agent,
+        x_bot_appid=x_bot_appid
+    )
 
 
 @app.websocket("/ws/{secret}")
@@ -985,11 +785,15 @@ async def websocket_endpoint(
         member: str = None,
         content: str = None
 ):
+    """WebSocket连接处理"""
     try:
+        # 检查密钥是否在黑名单中
+        if config.is_secret_blacklisted(secret):
+            # 直接拒绝连接，不显示日志
+            await websocket.close(code=1008)
+            return
+            
         await websocket.accept()
-
-        # 更新连接统计
-        await update_connection_stats(secret, True)
 
         # 发送初始心跳
         await websocket.send_bytes(json_module.dumps({
@@ -1000,7 +804,7 @@ async def websocket_endpoint(
         is_sandbox = any([group, member, content])
         environment = "沙盒环境" if is_sandbox else "正式环境"
 
-        lock = await get_lock_for_secret(secret)
+        lock = await cache_manager.get_lock_for_secret(secret)
         async with lock:
             if secret not in active_connections:
                 active_connections[secret] = {}
@@ -1018,11 +822,12 @@ async def websocket_endpoint(
             current_count = len(active_connections[secret])
 
             # 确保token缓存队列存在
-            if token:
-                message_cache.setdefault(secret, {"public": deque(maxlen=1000), "tokens": {}})
-                message_cache[secret]["tokens"].setdefault(token, deque(maxlen=1000))
-                logging.debug(
-                    f"初始化Token队列 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)}")
+            if token and secret not in config.no_cache_secrets:
+                cache_manager.message_cache.setdefault(secret, {
+                    "public": deque(maxlen=config.cache["max_public_messages"]), 
+                    "tokens": {}
+                })
+                cache_manager.message_cache[secret]["tokens"].setdefault(token, deque(maxlen=config.cache["max_token_messages"]))
 
         logging.info(
             f"WS连接成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token) if token else '无'} | "
@@ -1048,7 +853,8 @@ async def websocket_endpoint(
                         if secret in active_connections and websocket in active_connections[secret]:
                             active_connections[secret][websocket]["last_activity"] = time.time()
 
-                    logging.debug(f"收到WS消息: {data}")
+                    # 移除所有WS消息日志，不再记录
+                    pass
                     await handle_ws_message(data, websocket)
                     service_health["last_successful_ws_message"] = time.time()
                 except asyncio.TimeoutError:
@@ -1079,15 +885,14 @@ async def websocket_endpoint(
                     del active_connections[secret][websocket]
                     remaining = len(active_connections[secret])
 
-                    # 更新连接统计
-                    await update_connection_stats(secret, False)
-
                     # 确保离线token的缓存队列存在
-                    if token:
-                        message_cache.setdefault(secret, {"public": deque(maxlen=1000), "tokens": {}})
-                        message_cache[secret]["tokens"].setdefault(token, deque(maxlen=1000))
-                        logging.debug(
-                            f"准备离线缓存 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token)}")
+                    if token and secret not in config.no_cache_secrets:
+                        cache_manager.message_cache.setdefault(secret, {
+                            "public": deque(maxlen=config.cache["max_public_messages"]), 
+                            "tokens": {}
+                        })
+                        cache_manager.message_cache[secret]["tokens"].setdefault(token, deque(maxlen=config.cache["max_token_messages"]))
+                        # 移除准备离线缓存日志
 
                     logging.info(
                         f"WS断开连接处理完成 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | Token：{PrivacyUtils.sanitize_secret(token) if token else '无'} | "
@@ -1096,7 +901,6 @@ async def websocket_endpoint(
 
                     if not active_connections[secret]:
                         del active_connections[secret]
-                        connection_stats["active_keys"].discard(secret)
     except Exception as e:
         logging.error(f"WS连接全局异常: {str(e)}")
         service_health["error_count"] += 1
@@ -1105,430 +909,595 @@ async def websocket_endpoint(
         except:
             pass
 
+# 验证管理员令牌API
+@app.get("/api/admin/verify")
+async def verify_admin_token(admin: str = Depends(get_current_admin)):
+    """验证管理员令牌有效性"""
+    return {"status": "success", "username": admin}
 
-async def send_heartbeat(websocket: WebSocket, secret: str):
-    """定期发送心跳包保持连接"""
-    try:
-        while True:
-            try:
-                await asyncio.sleep(25)  # 每25秒发送一次心跳
-                await websocket.send_bytes(json_module.dumps({"op": 11}))
-                logging.debug(f"发送心跳包 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
-            except Exception as e:
-                logging.error(f"心跳发送失败: {e}")
-                # 如果连续3次心跳失败，退出心跳任务
-                break
-    except asyncio.CancelledError:
-        # 任务被取消，正常退出
-        pass
-    except Exception as e:
-        logging.error(f"心跳任务异常: {e}")
+# 管理员登出
+@app.post("/api/admin/logout")
+async def admin_logout(response: Response, admin: str = Depends(get_current_admin)):
+    """管理员登出"""
+    # 清除认证Cookie
+    response.delete_cookie(key=COOKIE_NAME)
+    return {"status": "success", "message": "已成功退出登录"}
 
-
-async def handle_ws_message(message: str, websocket: WebSocket):
-    try:
-        data = json_module.loads(message)
-        logging.debug(f"解析WS消息: {data}")
-        if data["op"] == 2:  # 鉴权
-            await websocket.send_bytes(json_module.dumps({
-                "op": 0,
-                "s": 1,
-                "t": "READY",
-                "d": {
-                    "version": 1,
-                    "session_id": "open-connection",
-                    "user": {"bot": True},
-                    "shard": [0, 0]
+# 获取系统统计信息
+@app.get("/api/admin/stats")
+async def get_admin_stats(admin: str = Depends(get_current_admin)):
+    """获取管理员统计信息"""
+    # 获取统计数据副本
+    with stats_manager.stats_lock:
+        stats_copy = copy.deepcopy(stats_manager.stats)
+    
+    # 获取连接信息
+    online_status = {}
+    for secret, connections in active_connections.items():
+        online_status[secret] = len(connections)
+    
+    # 获取转发配置
+    forward_config = []
+    for target in config.webhook_forward["targets"]:
+        forward_config.append({
+            "url": target["url"],
+            "secret": target["secret"]
+        })
+    
+    # 统计总AppID数量
+    total_appids = len(app_id_manager.appids) if hasattr(app_id_manager, 'appids') else 0
+    
+    # 统计每个密钥配置了多少个webhook链接
+    webhook_links_count = {}
+    for target in config.webhook_forward["targets"]:
+        secret = target["secret"]
+        if secret not in webhook_links_count:
+            webhook_links_count[secret] = 0
+        webhook_links_count[secret] += 1
+    
+    # 确保per_secret统计数据正确转换（不是defaultdict）
+    per_secret_dict = {}
+    if "per_secret" in stats_copy:
+        for secret, data in stats_copy["per_secret"].items():
+            if isinstance(data, dict):
+                per_secret_dict[secret] = {
+                    "ws": {
+                        "success": data.get("ws", {}).get("success", 0),
+                        "failure": data.get("ws", {}).get("failure", 0)
+                    },
+                    "wh": {
+                        "success": data.get("wh", {}).get("success", 0),
+                        "failure": data.get("wh", {}).get("failure", 0)
+                    },
+                    "webhook_links": webhook_links_count.get(secret, 0)
                 }
-            }))
-        elif data["op"] == 1:  # 心跳
-            await websocket.send_bytes(json_module.dumps({"op": 11}))
-    except Exception as e:
-        logging.error(f"WS消息处理错误: {e}")
-        service_health["error_count"] += 1
+    
+    # 返回整合的统计信息
+    return {
+        "total_appids": total_appids,
+        "ws": stats_copy.get("ws", {}),
+        "wh": stats_copy.get("wh", {}),
+        "total_messages": stats_copy.get("total_messages", 0),
+        "online": online_status,
+        "forward_config": forward_config,
+        "webhook_enabled": config.webhook_forward["enabled"],
+        "per_secret": per_secret_dict,
+        "webhook_links_count": webhook_links_count
+    }
 
-
-async def send_to_all(secret: str, data: bytes):
-    """向所有相关WebSocket连接发送消息"""
+# 创建AppID API - 简化版
+@app.post("/api/admin/appids/create")
+async def admin_create_appid(request: Request):
+    """管理员创建AppID"""
+    # 验证管理员身份
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="未提供有效的认证令牌"
+        )
+    
+    token = auth_header.split(" ")[1]
     try:
-        lock = await get_lock_for_secret(secret)
-        async with lock:
-            connections = active_connections.get(secret, {})
-            websockets = list(connections.keys())
-
-        success_count = 0
-        sandbox_success = 0
-        formal_success = 0
-        fail_count = 0
-
-        # 并发发送，提高效率
-        tasks = []
-        for ws in websockets:
-            task = asyncio.create_task(send_to_one(ws, data, connections[ws], secret))
-            tasks.append(task)
-
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for result in results:
-                if isinstance(result, Exception):
-                    fail_count += 1
-                    logging.error(f"消息发送任务异常: {result}")
-                    continue
-
-                if result:
-                    success_type, is_sandbox = result
-                    if success_type:
-                        success_count += 1
-                        if is_sandbox:
-                            sandbox_success += 1
-                        else:
-                            formal_success += 1
-                else:
-                    fail_count += 1
-
-        # 记录转发结果
-        if success_count > 0:
-            log_parts = [
-                f"消息转发成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)}",
-                f"总数：{success_count}/{len(websockets)}",
-                f"沙盒：{sandbox_success}" if sandbox_success > 0 else "",
-                f"正式：{formal_success}" if formal_success > 0 else ""
-            ]
-            logging.info(" | ".join([p for p in log_parts if p]))
-
-        if fail_count > 0:
-            logging.warning(
-                f"消息转发失败 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | "
-                f"失败数：{fail_count}/{len(websockets)}"
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        is_admin = payload.get("is_admin", False)
+        
+        if not username or not is_admin or username != config.admin.get("username"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="无效的管理员凭据"
             )
-
-        return success_count > 0
-    except Exception as e:
-        logging.error(f"发送消息全局异常: {e}")
-        service_health["error_count"] += 1
-        return False
-
-
-async def send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
-    """向单个WebSocket连接发送消息"""
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="无效的认证令牌"
+        )
+    
+    # 解析请求数据
     try:
-        is_sandbox = conn_info["is_sandbox"]
-        group = conn_info["group"]
-        member = conn_info["member"]
-        content_filter = conn_info["content"]
+        data = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="无效的JSON数据"
+        )
+    
+    # 获取参数
+    appid = data.get("appid")
+    secret = data.get("secret")
+    description = data.get("description", "")
+    
+    # 验证参数
+    if not appid or not appid.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="AppID不能为空"
+        )
+    
+    if not secret or len(secret) < 10:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="密钥长度必须至少为10个字符"
+        )
+    
+    # 创建AppID
+    success, status_msg = app_id_manager.create_appid(appid.strip(), secret.strip(), description.strip())
+    
+    if not success:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"创建AppID失败: {status_msg}"
+        )
+    
+    # 返回成功结果
+    return {
+        "appid": appid,
+        "secret": secret,
+        "description": description,
+        "create_time": time.time(),
+        "status": status_msg
+    }
 
-        should_send = True
-        if is_sandbox:
-            try:
-                msg_json = json_module.loads(data)
-                d = msg_json.get("d", {})
-                if group and d.get("group_openid") != group:
-                    should_send = False
-                if should_send and member and d.get("author", {}).get("member_openid") != member:
-                    should_send = False
-                if should_send and content_filter and content_filter not in d.get("content", ""):
-                    should_send = False
-            except JSONDecodeError:
-                logging.error(f"消息解析失败: {data}")
-
-        if should_send:
-            try:
-                await ws.send_bytes(data)
-                logging.debug(f"转发消息内容: {data.decode()}")
-
-                # 更新成功状态
-                lock = await get_lock_for_secret(secret)
-                async with lock:
-                    if secret in active_connections and ws in active_connections[secret]:
-                        active_connections[secret][ws]["failure_count"] = 0
-                        active_connections[secret][ws]["last_activity"] = time.time()
-
-                return (True, is_sandbox)
-            except Exception as e:
-                lock = await get_lock_for_secret(secret)
-                async with lock:
-                    if secret in active_connections and ws in active_connections[secret]:
-                        active_connections[secret][ws]["failure_count"] += 1
-                        if active_connections[secret][ws]["failure_count"] >= 5:
-                            try:
-                                await ws.close()
-                            except:
-                                pass
-
-                            # 从连接列表中移除
-                            if secret in active_connections and ws in active_connections[secret]:
-                                del active_connections[secret][ws]
-                                if not active_connections[secret]:
-                                    del active_connections[secret]
-                                logging.warning(f"连接重试过多关闭 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
-                return False
-        return None  # 不需要发送
-    except Exception as e:
-        logging.error(f"单个消息发送异常: {e}")
-        return False
-
-
-async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cache_type: str, token: str = None):
-    try:
-        success = 0
-        fail = 0
-        valid_count = 0
-        now = datetime.now()
-        total = len(cache_queue)
-
-        # 生成日志描述
-        if cache_type == 'token':
-            cache_desc = f"Token：{token[:3]}****{token[-3:] if token and len(token) > 6 else ''}" if token else "Token：未知"
-            log_prefix = "Token补发"
+# 简化版创建AppID接口 - 支持GET请求
+@app.get("/api/admin/create_appid")
+async def admin_create_appid_get(
+    request: Request,
+    appid: str = Query(..., description="要创建的AppID"),
+    secret: str = Query(..., description="密钥，至少10个字符"),
+    description: str = Query("", description="可选的描述信息"),
+    token: str = Query(None, description="管理员令牌")
+):
+    """通过GET请求创建AppID - 简化版接口"""
+    # 验证管理员身份
+    auth_header = request.headers.get("Authorization")
+    admin_token = None
+    
+    # 先尝试从Authorization头获取令牌
+    if auth_header and auth_header.startswith("Bearer "):
+        admin_token = auth_header.split(" ")[1]
+    
+    # 如果没有Authorization头，尝试从token参数获取
+    if not admin_token and token:
+        admin_token = token
+    
+    # 如果还是没有，尝试从Cookie获取
+    if not admin_token:
+        admin_token = request.cookies.get(COOKIE_NAME)
+    
+    if not admin_token:
+        # 如果是浏览器请求，重定向到登录页面
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/login", status_code=302)
         else:
-            cache_desc = "公共缓存"
-            log_prefix = "公共补发"
-
-        logging.info(
-            f"开始补发{cache_desc} | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | 总量：{total}")
-
-        # 分批次发送（每秒10条）
-        batch_size = 10
-        for i in range(0, len(cache_queue), batch_size):
-            batch = cache_queue[i:i + batch_size]
-            batch_success = 0
-            batch_fail = 0
-
-            for expiry, msg in batch:
-                if expiry < now:
-                    continue
-                valid_count += 1
-                try:
-                    await websocket.send_bytes(msg)
-                    batch_success += 1
-                    logging.debug(f"补发{cache_desc}消息: {msg.decode()}")
-                except Exception as e:
-                    batch_fail += 1
-
-            success += batch_success
-            fail += batch_fail
-
-            # 记录批次日志
-            logging.info(
-                f"{log_prefix}进度 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | "
-                f"批次：{i // batch_size + 1} | 本批：{batch_success}成功/{batch_fail}失败"
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="未提供有效的认证令牌"
             )
-
-            # 严格1秒间隔
-            if i + batch_size < len(cache_queue):
-                await asyncio.sleep(1)
-
-        logging.info(
-            f"{cache_desc}补发完成 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | "
-            f"总消息：{total} | 有效消息：{valid_count} | "
-            f"成功：{success} | 失败：{fail}"
-        )
-    except WebSocketDisconnect:
-        logging.warning(
-            f"补发中断：WebSocket连接已关闭 | 密钥：{secret[:3]}****{secret[-3:] if secret and len(secret) > 6 else ''} | {cache_desc}")
-    except Exception as e:
-        logging.error(f"{cache_desc}补发异常: {str(e)}")
-
-
-async def resend_token_cache(secret: str, token: str, websocket: WebSocket):
-    """补发token缓存消息"""
+    
     try:
-        await asyncio.sleep(3)
-        messages = await cache_manager.get_messages_for_token(secret, token)
-        await resend_cache(
-            secret=secret,
-            websocket=websocket,
-            cache_queue=messages,
-            cache_type='token',
-            token=token
+        payload = jwt.decode(admin_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        is_admin = payload.get("is_admin", False)
+        
+        if not username or not is_admin or username != config.admin.get("username"):
+            # 如果是浏览器请求，重定向到登录页面
+            if "text/html" in request.headers.get("accept", ""):
+                return RedirectResponse(url="/login", status_code=302)
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="无效的管理员凭据"
+                )
+    except Exception:
+        # 如果是浏览器请求，重定向到登录页面
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/login", status_code=302)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="无效的认证令牌"
+            )
+    
+    # 验证参数
+    if not appid or not appid.strip():
+        # 如果是浏览器请求，重定向回表单页面
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/console#appids", status_code=302)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="AppID不能为空"
+            )
+    
+    if not secret or len(secret) < 10:
+        # 如果是浏览器请求，重定向回表单页面
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/console#appids", status_code=302)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="密钥长度必须至少为10个字符"
+            )
+    
+    # 创建AppID
+    success, status_msg = app_id_manager.create_appid(appid.strip(), secret.strip(), description.strip())
+    
+    if not success:
+        # 如果是浏览器请求，重定向回表单页面
+        if "text/html" in request.headers.get("accept", ""):
+            return RedirectResponse(url="/console#appids", status_code=302)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"创建AppID失败: {status_msg}"
+            )
+    
+    # 如果是浏览器请求，重定向回控制台
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(url="/console#appids", status_code=302)
+    
+    # 返回成功结果
+    return {
+        "appid": appid,
+        "secret": secret,
+        "description": description,
+        "create_time": time.time(),
+        "status": status_msg
+    }
+
+# 获取所有AppID
+@app.get("/api/admin/appids")
+async def get_all_appids(admin: str = Depends(get_current_admin)):
+    """获取所有AppID信息"""
+    result = []
+    
+    # 获取统计数据
+    with stats_manager.stats_lock:
+        stats_copy = stats_manager.stats.copy()
+    
+    for appid_info in app_id_manager.get_all_appids():
+        appid = appid_info["appid"]
+        secret = appid_info["secret"]
+        description = appid_info["description"]
+        create_time = appid_info["create_time"]
+        
+        # 获取该密钥的统计数据
+        ws_stats = {"success": 0, "failure": 0}
+        wh_stats = {"success": 0, "failure": 0}
+        if "per_secret" in stats_copy and secret in stats_copy["per_secret"]:
+            ws_stats = stats_copy["per_secret"][secret].get("ws", ws_stats)
+            wh_stats = stats_copy["per_secret"][secret].get("wh", wh_stats)
+        
+        result.append({
+            "appid": appid,
+            "secret": secret,  # 对管理员显示完整密钥
+            "secret_masked": PrivacyUtils.sanitize_secret(secret),  # 同时提供脱敏版本，以便管理员可以选择使用
+            "description": description,
+            "create_time": create_time,
+            "ws": ws_stats,
+            "wh": wh_stats
+        })
+    
+    # 按创建时间排序
+    result.sort(key=lambda x: x["create_time"], reverse=True)
+    return result
+
+# 删除AppID
+@app.delete("/api/admin/appids/{appid}")
+async def delete_appid(appid: str, admin: str = Depends(get_current_admin)):
+    """删除指定AppID"""
+    if not app_id_manager.delete_appid(appid):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="AppID不存在"
         )
-    except Exception as e:
-        logging.error(f"Token缓存补发异常: {str(e)}")
+    
+    return {"status": "success", "appid": appid}
 
+# 获取系统设置
+@app.get("/api/admin/settings")
+async def get_system_settings(admin: str = Depends(get_current_admin)):
+    """获取系统设置"""
+    return {
+        "log_level": config.log_level,
+        "deduplication_ttl": config.deduplication_ttl,
+        "raw_content": getattr(config, 'raw_content', {"enabled": False, "path": "logs"}),
+        "ssl": config.ssl
+    }
 
-async def resend_public_cache(secret: str, websocket: WebSocket):
-    """补发公共缓存消息"""
-    try:
-        await asyncio.sleep(3)
-        messages = await cache_manager.get_public_messages(secret)
-        await resend_cache(
-            secret=secret,
-            websocket=websocket,
-            cache_queue=messages,
-            cache_type='public'
+# 更新系统设置
+@app.post("/api/admin/settings/update")
+async def update_system_settings(
+    settings_data: SystemSettings, 
+    admin: str = Depends(get_current_admin),
+    request: Request = None
+):
+    """更新系统设置，使用Pydantic模型验证输入"""
+    # 使用验证过的数据更新配置
+    settings_dict = settings_data.dict()
+    
+    # 验证raw_content配置
+    if "raw_content" in settings_dict:
+        raw_content = settings_dict["raw_content"]
+        
+        # 验证必需的字段
+        if not isinstance(raw_content, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="raw_content配置必须是对象格式"
+            )
+        
+        # 设置默认值
+        if "enabled" not in raw_content:
+            raw_content["enabled"] = False
+        if "path" not in raw_content:
+            raw_content["path"] = "logs"
+        
+        # 验证enabled字段
+        if not isinstance(raw_content["enabled"], bool):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="raw_content.enabled必须是布尔值"
+            )
+        
+        # 验证path字段
+        path = raw_content["path"]
+        if not isinstance(path, str) or not path.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="raw_content.path必须是非空字符串"
+            )
+        
+        # 安全检查路径
+        if ".." in path or path.startswith("/") or ":" in path:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="raw_content.path路径格式不安全"
+            )
+        
+        settings_dict["raw_content"] = raw_content
+    
+    result = config.update_settings(settings_dict)
+    
+    # 额外处理日志级别的更新
+    if "log_level" in settings_dict:
+        logging.getLogger().setLevel(settings_dict["log_level"])
+    
+    # 记录操作日志
+    client_ip = request.client.host if request else "未知IP"
+    logging.info(f"管理员 {admin} ({client_ip}) 更新了系统设置")
+    
+    return {"status": "success", "message": "系统设置已更新"}
+
+# 更新注册设置
+@app.post("/api/admin/registration/settings/update")
+async def update_registration_settings(
+    request: Request,
+    admin: str = Depends(get_current_admin)
+):
+    """更新注册设置"""
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="注册功能已被移除"
+    )
+
+# 获取用户短密钥列表
+@app.get("/api/admin/users/{username}/shortkeys")
+async def get_user_shortkeys(username: str, include_secrets: bool = False, admin: str = Depends(get_current_admin)):
+    """获取指定用户的所有短密钥"""
+    # 用户功能已移除
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail="用户功能已移除"
+    )
+
+# 黑名单相关API
+@app.get("/api/admin/blacklist")
+async def get_blacklist(admin: str = Depends(get_current_admin)):
+    """获取黑名单配置"""
+    if not hasattr(config, 'blacklist'):
+        config.blacklist = {
+            'secrets': [],
+            'enabled': True
+        }
+    return config.blacklist
+
+@app.post("/api/admin/blacklist/add")
+async def add_to_blacklist(data: Dict[str, str], admin: str = Depends(get_current_admin)):
+    """添加密钥到黑名单"""
+    secret = data.get('secret')
+    if not secret:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "缺少密钥参数"}
         )
-    except Exception as e:
-        logging.error(f"公共缓存补发异常: {str(e)}")
+    
+    # 确保黑名单存在
+    if not hasattr(config, 'blacklist'):
+        config.blacklist = {
+            'secrets': [],
+            'enabled': True
+        }
+    
+    # 检查密钥是否已在黑名单中
+    if secret in config.blacklist['secrets']:
+        return {"status": "success", "message": "密钥已在黑名单中"}
+    
+    # 添加到黑名单
+    config.blacklist['secrets'].append(secret)
+    config.update_blacklist(config.blacklist)
+    
+    # 断开该密钥的所有WebSocket连接，不记录日志
+    disconnected_count = 0
+    if secret in active_connections:
+        connections = list(active_connections[secret].keys())
+        for ws in connections:
+            try:
+                await ws.close(code=1008)
+                disconnected_count += 1
+            except Exception:
+                pass
+    
+    return {
+        "status": "success", 
+        "message": f"密钥已添加到黑名单，断开了 {disconnected_count} 个连接"
+    }
 
+@app.post("/api/admin/blacklist/remove")
+async def remove_from_blacklist(data: Dict[str, str], admin: str = Depends(get_current_admin)):
+    """从黑名单移除密钥"""
+    secret = data.get('secret')
+    if not secret:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "缺少密钥参数"}
+        )
+    
+    # 确保黑名单存在
+    if not hasattr(config, 'blacklist'):
+        config.blacklist = {
+            'secrets': [],
+            'enabled': True
+        }
+    
+    # 检查密钥是否在黑名单中
+    if secret not in config.blacklist['secrets']:
+        return {"status": "success", "message": "密钥不在黑名单中"}
+    
+    # 从黑名单移除
+    config.blacklist['secrets'].remove(secret)
+    config.update_blacklist(config.blacklist)
+    
+    return {"status": "success", "message": "密钥已从黑名单移除"}
 
-async def watch_config():
-    """配置文件监视任务"""
-    last_mtime = 0
-    last_valid_level = logger.level
-    while True:
+@app.post("/api/admin/blacklist/toggle")
+async def toggle_blacklist(data: Dict[str, bool], admin: str = Depends(get_current_admin)):
+    """启用或禁用黑名单功能"""
+    enabled = data.get('enabled')
+    if enabled is None:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "缺少enabled参数"}
+        )
+    
+    # 确保黑名单存在
+    if not hasattr(config, 'blacklist'):
+        config.blacklist = {
+            'secrets': [],
+            'enabled': True
+        }
+    
+    # 更新黑名单状态
+    config.blacklist['enabled'] = enabled
+    config.update_blacklist(config.blacklist)
+    
+    return {
+        "status": "success", 
+        "message": f"黑名单功能已{'启用' if enabled else '禁用'}"
+    }
+
+@app.websocket("/api/ws/{appid}")
+async def appid_websocket_endpoint(
+        websocket: WebSocket,
+        appid: str,
+        token: str = None,
+        group: str = None,
+        member: str = None,
+        content: str = None,
+        signature: str = None,
+        timestamp: str = None,
+        nonce: str = None
+):
+    """通过AppID处理WebSocket连接"""
+    # 根据AppID获取原始密钥
+    secret = app_id_manager.get_secret_by_appid(appid)
+    if not secret:
         try:
-            current_mtime = os.path.getmtime("config.ini")
-            if current_mtime != last_mtime:
-                last_mtime = current_mtime
-                config = configparser.ConfigParser()
-                config.read('config.ini', encoding='UTF-8')
-                new_level = config.get('DEFAULT', 'log', fallback='INFO').upper()
-                if new_level == "TESTING":
-                    new_level = "DEBUG"
-
-                # 验证日志级别有效性
-                temp_logger = logging.getLogger('temp_validation')
-                try:
-                    temp_logger.setLevel(new_level)
-                    valid = True
-                except ValueError:
-                    valid = False
-
-                if valid:
-                    logger.setLevel(new_level)
-                    for handler in logger.handlers:
-                        handler.setLevel(new_level)
-                    last_valid_level = new_level
-                    logging.info(f"检测到配置文件更新，日志级别已更改为：{new_level}")
-
-                    # 输出去重配置更新日志
-                    deduplication_ttl = config.getint('DEFAULT', 'deduplication_ttl', fallback=20)
-                    logging.info(f"消息去重有效期配置为：{deduplication_ttl}秒")
-
-                    # 输出原始内容记录配置更新日志
-                    raw_content_enabled = config.getboolean('DEFAULT', 'save_raw_content', fallback=False)
-                    raw_content_path = config.get('DEFAULT', 'raw_content_path', fallback='logs')
-                    logging.info(f"原始内容记录：{'启用' if raw_content_enabled else '禁用'}, 路径: {raw_content_path}")
-
-                    # 输出不缓存密钥配置更新日志
-                    no_cache_secrets = load_no_cache_secrets()
-                    if no_cache_secrets:
-                        sanitized_secrets = [PrivacyUtils.sanitize_secret(s) for s in no_cache_secrets]
-                        logging.info(f"不缓存密钥列表：{', '.join(sanitized_secrets)}")
-                    else:
-                        logging.info("不缓存密钥列表：无")
-                else:
-                    logger.setLevel(last_valid_level)
-                    for handler in logger.handlers:
-                        handler.setLevel(last_valid_level)
-                    logging.error(
-                        f"配置的日志级别无效: {new_level}，已恢复为之前的级别: {logging.getLevelName(last_valid_level)}")
-
-        except FileNotFoundError:
+            await websocket.accept()
+            await websocket.close(code=1008, reason="无效的AppID")
+        except Exception:
             pass
-        except Exception as e:
-            logging.error(f"配置文件监视错误: {str(e)}")
-        await asyncio.sleep(20)
-
-
-# 保存原始内容到日志文件
-def save_raw_content(content_bytes, secret, message_id=None, status=None, client_ip=None):
-    # 将保存操作提交到线程池
-    thread_pool.submit(_save_raw_content_thread, content_bytes, secret, message_id, status, client_ip)
-    return True
-
-
-# 线程中执行的保存函数
-def _save_raw_content_thread(content_bytes, secret, message_id=None, status=None, client_ip=None):
-    try:
-        config = load_raw_content_config()
-        if not config['enabled']:
-            return False
-
-        # 创建日志文件夹
-        log_dir = Path(config['path'])
-        log_dir.mkdir(exist_ok=True, parents=True)
-
-        # 生成当前日期的文件名
-        current_date = datetime.now().strftime('%Y%m%d')
-        filename = f"webhook_raw_{current_date}.log"
-        file_path = log_dir / filename
-
-        # 获取当前时间戳
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-        # 添加消息分隔符和元信息
-        secret_prefix = PrivacyUtils.sanitize_secret(secret) if secret else "unknown"
-        message_info = f"[{timestamp}] Secret: {secret_prefix}"
-
-        # 添加IP地址信息
-        if client_ip:
-            message_info += f" | IP: {client_ip}"
-
-        # 添加消息ID信息
-        if message_id:
-            message_info += f" | Message ID: {message_id}"
-
-        # 添加消息状态信息
-        if status:
-            message_info += f" | Status: {status}"
-
-        separator = f"\n\n---------\n{message_info}\n"
-
-        # 以追加模式打开文件并写入内容
+        return
+    
+    # 验证签名（如果提供了签名参数）
+    if signature and timestamp and nonce:
+        if not app_id_manager.verify_signature(appid, signature, timestamp, nonce):
+            try:
+                await websocket.accept()
+                await websocket.close(code=1008, reason="签名验证失败")
+            except Exception:
+                pass
+            return
+        
+    # 检查原始密钥是否在黑名单中
+    if config.is_secret_blacklisted(secret):
         try:
-            content_str = content_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            content_str = f"[Binary content, length: {len(content_bytes)} bytes]"
-
-        with open(file_path, 'a', encoding='utf-8') as f:
-            f.write(separator)
-            f.write(content_str)
-
-        logging.info(f"原始内容已追加到文件: {filename}")
-        return True
-    except Exception as e:
-        logging.error(f"保存原始内容失败: {str(e)}")
-        return False
-
+            # 直接拒绝连接，不显示日志
+            await websocket.close(code=1008)
+        except Exception:
+            pass
+        return
+    
+    # 转发到标准WebSocket处理流程
+    await websocket_endpoint(
+        websocket=websocket,
+        secret=secret,
+        token=token,
+        group=group,
+        member=member,
+        content=content
+    )
 
 if __name__ == "__main__":
-    import asyncio
-    from models import ensure_tables
-
-    # 确保数据库表已创建
-    asyncio.run(ensure_tables())
-
-    # 读取SSL配置
-    def load_ssl_config():
-        config = configparser.ConfigParser()
-        config.read('config.ini', encoding='UTF-8')
-        
-        # 尝试从配置读取
-        if 'SSL' in config:
-            return {
-                "ssl_keyfile": config.get('SSL', 'ssl_keyfile', fallback=""),
-                "ssl_certfile": config.get('SSL', 'ssl_certfile', fallback=""),
-            }
-        return {
-            "ssl_keyfile": "",
-            "ssl_certfile": ""
-        }
-
-    # 加载SSL配置
-    ssl_kwargs = load_ssl_config()
-
-    # 设置端口
-    port = 8443 if ssl_kwargs["ssl_keyfile"] and ssl_kwargs["ssl_certfile"] else 8000
+    import uvicorn
+    
+    # 使用配置文件中的SSL设置
+    ssl_config = config.ssl
+    port = config.port
+    use_ssl = ssl_config["ssl_keyfile"] and ssl_config["ssl_certfile"]
 
     # 创建UVICORN配置
-    config = uvicorn.Config(
+    uvicorn_config = uvicorn.Config(
         app,
         host="0.0.0.0",
         port=port,
+        log_level="info",
         log_config=None,
         access_log=False
     )
-
     # 只有当证书都不为空时才添加SSL配置
-    if ssl_kwargs["ssl_keyfile"] and ssl_kwargs["ssl_certfile"]:
-        config.ssl_keyfile = ssl_kwargs["ssl_keyfile"]
-        config.ssl_certfile = ssl_kwargs["ssl_certfile"]
+    if use_ssl:
+        uvicorn_config.ssl_keyfile = ssl_config["ssl_keyfile"]
+        uvicorn_config.ssl_certfile = ssl_config["ssl_certfile"]
         logging.info(f"启用SSL，监听端口: {port}")
     else:
         logging.info(f"未启用SSL，监听端口: {port}")
 
+    # 再次确保日志级别正确
+    logging.getLogger().setLevel(logging.INFO)
+
     # 启动服务
-    server = uvicorn.Server(config)
+    server = uvicorn.Server(uvicorn_config)
     asyncio.run(server.serve())
+

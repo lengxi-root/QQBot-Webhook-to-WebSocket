@@ -1,0 +1,3399 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>管理员面板 - WebSocket代理服务</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary-color: #8e6cc5;
+            --primary-light: #b79fdf;
+            --primary-dark: #6a4c9c;
+            --accent-color: #a78bda;
+            --accent-light: #d4c4f1;
+            --accent-dark: #7b5db3;
+            --bg-gradient-start: #f8f7fd;
+            --bg-gradient-end: #eae5f7;
+            --sidebar-gradient-start: #6a4c9c;
+            --sidebar-gradient-end: #4a3572;
+            --card-bg: #ffffff;
+            --card-shadow: 0 8px 20px rgba(138, 114, 201, 0.1);
+            --text-primary: #333333;
+            --text-secondary: #6c757d;
+            --text-light: rgba(255, 255, 255, 0.9);
+            --border-color: rgba(138, 114, 201, 0.15);
+        }
+
+        body {
+            min-height: 100vh;
+            padding-top: 0;
+            padding-bottom: 0;
+            overflow-x: hidden;
+            font-family: 'Poppins', 'Noto Sans SC', sans-serif;
+            background: linear-gradient(135deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
+            color: var(--text-primary);
+        }
+        
+        .sidebar {
+            min-height: 100vh;
+            background: linear-gradient(180deg, var(--sidebar-gradient-start) 0%, var(--sidebar-gradient-end) 100%);
+            padding-top: 1.5rem;
+            position: sticky;
+            top: 0;
+            box-shadow: 2px 0 15px rgba(0,0,0,0.1);
+            z-index: 100;
+            transition: all 0.3s ease;
+        }
+        
+        .sidebar:hover {
+            box-shadow: 4px 0 20px rgba(0,0,0,0.15);
+        }
+        
+        .sidebar-link {
+            display: block;
+            padding: 0.8rem 1.2rem;
+            color: rgba(255, 255, 255, 0.8);
+            text-decoration: none;
+            border-radius: 0.5rem;
+            margin-bottom: 0.8rem;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            border-left: 3px solid transparent;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .sidebar-link:hover, .sidebar-link.active {
+            color: #fff;
+            background: rgba(255, 255, 255, 0.15);
+            border-left: 3px solid var(--accent-light);
+            transform: translateX(5px);
+        }
+        
+        .sidebar-link i {
+            margin-right: 0.7rem;
+            transition: all 0.3s;
+        }
+        
+        .sidebar-link:hover i, .sidebar-link.active i {
+            transform: scale(1.2);
+            color: var(--accent-light);
+        }
+        
+        .sidebar-link:before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 3px;
+            height: 0;
+            background: var(--accent-light);
+            transition: height 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        .sidebar-link:hover:before, .sidebar-link.active:before {
+            height: 100%;
+        }
+        
+        .content {
+            padding: 2rem;
+            transition: all 0.3s ease;
+        }
+        
+        .title-bar {
+            background: rgba(255, 255, 255, 0.95);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.2rem 2rem;
+            margin-bottom: 2rem;
+            border-radius: 0 0 1rem 1rem;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+            backdrop-filter: blur(10px);
+            transition: all 0.3s ease;
+        }
+        
+        .title-bar:hover {
+            box-shadow: 0 6px 20px rgba(0,0,0,0.1);
+        }
+        
+        .panel-card {
+            margin-bottom: 2rem;
+            box-shadow: var(--card-shadow);
+            border-radius: 1rem;
+            overflow: hidden;
+            transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1), box-shadow 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            border: 1px solid var(--border-color);
+            transform: translateY(0);
+            background-color: var(--card-bg);
+        }
+        
+        .panel-card:hover {
+            transform: translateY(-7px);
+            box-shadow: 0 15px 30px rgba(138, 114, 201, 0.15);
+        }
+        
+        .panel-header {
+            background: linear-gradient(135deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.2rem;
+            font-weight: 600;
+            color: var(--primary-dark);
+        }
+        
+        .panel-body {
+            padding: 1.8rem;
+            background-color: var(--card-bg);
+        }
+        
+        .stats-number {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary-color), var(--accent-color));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            transition: all 0.3s ease;
+        }
+        
+        .stats-card {
+            padding: 1.5rem;
+            border-radius: 1rem;
+            margin-bottom: 1rem;
+            text-align: center;
+            box-shadow: var(--card-shadow);
+            transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1), box-shadow 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            position: relative;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
+            transform: translateY(0);
+            background-color: var(--card-bg);
+        }
+        
+        .stats-card:hover {
+            transform: translateY(-7px);
+            box-shadow: 0 15px 30px rgba(138, 114, 201, 0.15);
+        }
+        
+        .stats-card:after {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(135deg, rgba(255,255,255,0.2), rgba(255,255,255,0));
+            transform: rotate(45deg);
+            pointer-events: none;
+            transition: all 0.5s ease;
+        }
+        
+        .stats-card:hover:after {
+            top: -100%;
+            left: -100%;
+        }
+        
+        .bg-info-light {
+            background: linear-gradient(135deg, #e8e4f7 0%, #d4c4f1 100%);
+        }
+        
+        .bg-success-light {
+            background: linear-gradient(135deg, #e4e9f7 0%, #c4d4f1 100%);
+        }
+        
+        .bg-warning-light {
+            background: linear-gradient(135deg, #f0e6f7 0%, #e4c4f1 100%);
+        }
+        
+        .bg-danger-light {
+            background: linear-gradient(135deg, #f7e4e8 0%, #f1c4d4 100%);
+        }
+        
+        .user-name {
+            font-weight: 600;
+            color: var(--primary-dark);
+        }
+        
+        .auth-page {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, var(--primary-color) 0%, var(--accent-color) 100%);
+            animation: gradientAnimation 15s ease infinite;
+        }
+        
+        @keyframes gradientAnimation {
+            0% {
+                background-position: 0% 50%;
+            }
+            50% {
+                background-position: 100% 50%;
+            }
+            100% {
+                background-position: 0% 50%;
+            }
+        }
+        
+        .auth-card {
+            max-width: 500px;
+            width: 100%;
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 1rem;
+            box-shadow: 0 15px 30px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            transform: translateY(0);
+            transition: transform 0.5s ease;
+            transform-style: preserve-3d;
+            perspective: 1000px;
+        }
+        
+        .auth-card:hover {
+            transform: rotateY(5deg) rotateX(5deg);
+        }
+        
+        .auth-header {
+            text-align: center;
+            padding: 2.5rem 0 1.5rem;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .auth-header:before {
+            content: '';
+            position: absolute;
+            top: -100px;
+            left: -100px;
+            width: 200px;
+            height: 200px;
+            background: linear-gradient(135deg, rgba(138, 114, 201, 0.3), rgba(183, 159, 223, 0.3));
+            border-radius: 50%;
+            z-index: -1;
+        }
+        
+        .auth-header:after {
+            content: '';
+            position: absolute;
+            bottom: -100px;
+            right: -100px;
+            width: 200px;
+            height: 200px;
+            background: linear-gradient(135deg, rgba(183, 159, 223, 0.3), rgba(138, 114, 201, 0.3));
+            border-radius: 50%;
+            z-index: -1;
+        }
+        
+        .hidden {
+            display: none;
+        }
+        
+        /* 按钮动效 */
+        .btn {
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            z-index: 1;
+        }
+        
+        .btn:before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 0%;
+            height: 100%;
+            background: rgba(255, 255, 255, 0.2);
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+            z-index: -1;
+        }
+        
+        .btn:hover:before {
+            width: 100%;
+        }
+        
+        /* 表格样式 */
+        .table {
+            border-radius: 0.5rem;
+            overflow: hidden;
+            box-shadow: 0 0 15px rgba(138, 114, 201, 0.05);
+        }
+        
+        .table thead th {
+            background: linear-gradient(135deg, var(--bg-gradient-start) 0%, var(--bg-gradient-end) 100%);
+            border-color: var(--border-color);
+            padding: 0.75rem 1rem;
+            font-weight: 600;
+            color: var(--primary-dark);
+        }
+        
+        .table tbody tr {
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        .table tbody tr:hover {
+            background-color: rgba(138, 114, 201, 0.05);
+            transform: scale(1.01);
+        }
+        
+        /* 表单控件 */
+        .form-control, .form-select {
+            border-radius: 0.5rem;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border-color);
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        .form-control:focus, .form-select:focus {
+            box-shadow: 0 0 0 0.25rem rgba(138, 114, 201, 0.25);
+            border-color: rgba(138, 114, 201, 0.5);
+        }
+        
+        /* 加载动画 */
+        .loading {
+            display: inline-block;
+            width: 1.5rem;
+            height: 1.5rem;
+            border: 3px solid rgba(138, 114, 201, 0.1);
+            border-radius: 50%;
+            border-top-color: var(--primary-color);
+            animation: spin 1s cubic-bezier(0.25, 0.8, 0.25, 1) infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        /* 自定义滚动条 */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        
+        ::-webkit-scrollbar-track {
+            background: rgba(138, 114, 201, 0.05);
+            border-radius: 10px;
+        }
+        
+        ::-webkit-scrollbar-thumb {
+            background: rgba(138, 114, 201, 0.5);
+            border-radius: 10px;
+        }
+        
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(138, 114, 201, 0.7);
+        }
+        
+        /* 错误提示样式 */
+        .text-danger {
+            position: relative;
+            padding-left: 20px;
+        }
+        
+        /* 添加脉冲圆圈动画 */
+        .pulsing-circle {
+            width: 15px;
+            height: 15px;
+            border-radius: 50%;
+            background: var(--primary-color);
+            position: relative;
+            animation: pulse 2s infinite;
+        }
+        
+        .pulsing-circle:before, .pulsing-circle:after {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: rgba(138, 114, 201, 0.6);
+            animation: pulse-ring 2s infinite;
+        }
+        
+        .pulsing-circle:after {
+            animation-delay: 0.5s;
+        }
+        
+        @keyframes pulse {
+            0% {
+                transform: scale(0.95);
+                box-shadow: 0 0 0 0 rgba(138, 114, 201, 0.7);
+            }
+            70% {
+                transform: scale(1);
+                box-shadow: 0 0 0 10px rgba(138, 114, 201, 0);
+            }
+            100% {
+                transform: scale(0.95);
+                box-shadow: 0 0 0 0 rgba(138, 114, 201, 0);
+            }
+        }
+        
+        @keyframes pulse-ring {
+            0% {
+                transform: scale(0.7);
+                opacity: 0.5;
+            }
+            50% {
+                opacity: 0.2;
+            }
+            100% {
+                transform: scale(2);
+                opacity: 0;
+            }
+        }
+        
+        /* 添加页面过渡动画 */
+        .page-content {
+            opacity: 0;
+            transform: translateY(20px);
+            transition: opacity 0.5s cubic-bezier(0.25, 0.8, 0.25, 1), transform 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        .page-content.active {
+            opacity: 1;
+            transform: translateY(0);
+        }
+        
+        /* 按钮波纹效果 */
+        .btn {
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .btn:after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            background: rgba(255,255,255,0.4);
+            border-radius: 50%;
+            transform: scale(0) translate(-50%, -50%);
+            transform-origin: top left;
+            opacity: 0;
+        }
+        
+        .btn:active:after {
+            animation: ripple 0.6s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        @keyframes ripple {
+            0% {
+                transform: scale(0) translate(-50%, -50%);
+                opacity: 1;
+            }
+            100% {
+                transform: scale(20) translate(-50%, -50%);
+                opacity: 0;
+            }
+        }
+        
+        /* 添加登录按钮加载动画 */
+        .loading-spinner {
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+        }
+        
+        /* 3D卡片效果 */
+        .auth-card {
+            transition: transform 0.5s cubic-bezier(0.25, 0.8, 0.25, 1);
+            transform-style: preserve-3d;
+            perspective: 1000px;
+        }
+        
+        .auth-card:hover {
+            transform: rotateY(5deg) rotateX(5deg);
+        }
+
+        /* 自定义按钮颜色 */
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-primary:hover, .btn-primary:focus {
+            background-color: var(--primary-dark);
+            border-color: var(--primary-dark);
+        }
+        
+        .btn-outline-primary {
+            color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-outline-primary:hover, .btn-outline-primary:focus {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        /* 徽章样式 */
+        .badge {
+            padding: 0.4em 0.6em;
+            border-radius: 0.5rem;
+            font-weight: 500;
+        }
+        
+        .badge.bg-primary {
+            background-color: var(--primary-color) !important;
+        }
+        
+        .badge.bg-danger {
+            background-color: #e57b9e !important;
+        }
+
+        /* 侧边栏标题样式 */
+        .sidebar-title {
+            color: var(--text-light);
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            padding: 0 1.2rem;
+            letter-spacing: 0.5px;
+        }
+
+        /* 用户信息样式 */
+        .sidebar-username {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 0.5rem;
+            padding: 0.8rem 1rem;
+            margin: 0 0.5rem 1.5rem;
+        }
+
+        .pulse-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background-color: #4ade80;
+            border-radius: 50%;
+            margin-right: 0.5rem;
+            position: relative;
+        }
+
+        .pulse-dot:after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            border-radius: 50%;
+            background-color: #4ade80;
+            animation: pulse-dot 1.5s infinite;
+        }
+
+        @keyframes pulse-dot {
+            0% {
+                transform: scale(1);
+                opacity: 1;
+            }
+            100% {
+                transform: scale(3);
+                opacity: 0;
+            }
+        }
+
+        /* 卡片内容间距 */
+        .card-spacer {
+            padding: 1rem 0;
+        }
+
+        /* 表格内容对齐 */
+        .table td, .table th {
+            vertical-align: middle;
+        }
+
+        /* 输入框聚焦效果 */
+        .form-control:focus, .form-select:focus {
+            border-color: var(--primary-light);
+            box-shadow: 0 0 0 0.25rem rgba(138, 114, 201, 0.25);
+        }
+
+        /* 开关按钮样式 */
+        .form-check-input:checked {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+
+        /* 添加旋转动画 */
+        @keyframes rotate {
+            from {
+                transform: rotate(0deg);
+            }
+            to {
+                transform: rotate(360deg);
+            }
+        }
+        
+        .rotate-animation {
+            animation: rotate 1s linear;
+        }
+        
+        /* 表格内容垂直居中 */
+        .table td {
+            vertical-align: middle;
+        }
+        
+        /* 按钮组样式 */
+        .btn-group-sm > .btn {
+            padding: 0.25rem 0.5rem;
+            font-size: 0.75rem;
+        }
+        
+        /* 表格空状态样式 */
+        .empty-state {
+            padding: 3rem 1rem;
+            text-align: center;
+        }
+        
+        .empty-state i {
+            font-size: 3rem;
+            opacity: 0.3;
+            margin-bottom: 1rem;
+        }
+        
+        /* 表格悬停效果增强 */
+        .table-hover tbody tr:hover {
+            background-color: rgba(138, 114, 201, 0.08);
+        }
+        
+        /* 徽章样式增强 */
+        .badge {
+            font-weight: 500;
+            letter-spacing: 0.5px;
+        }
+    </style>
+    <!-- 添加Google Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- 管理员面板 -->
+    <div id="admin-panel">
+        <div class="container-fluid">
+            <div class="row">
+                <!-- 侧边栏 -->
+                <div class="col-md-2 sidebar text-white">
+                    <div class="d-flex justify-content-between align-items-center mb-4">
+                        <h5 class="sidebar-title mb-0">WebSocket代理</h5>
+                    </div>
+                    <div class="sidebar-username mb-4 px-2 d-none" id="sidebar-user-section">
+                        <small class="text-white-50">当前用户</small>
+                        <div class="d-flex align-items-center mt-1">
+                            <div class="pulse-dot"></div>
+                            <span class="ms-1 fw-bold" id="sidebar-username" style="text-shadow: 0 1px 2px rgba(0,0,0,0.1);"></span>
+                        </div>
+                    </div>
+                    <nav class="nav flex-column">
+                        <!-- 管理员菜单 -->
+                        <div id="admin-menu">
+                            <a href="#dashboard" class="sidebar-link active" data-page="dashboard">
+                                <i class="bi bi-speedometer2"></i> 控制台
+                            </a>
+                            <a href="#appids" class="sidebar-link" data-page="appids">
+                                <i class="bi bi-key"></i> AppID管理
+                            </a>
+                            <a href="#settings" class="sidebar-link" data-page="settings">
+                                <i class="bi bi-gear"></i> 系统配置
+                            </a>
+                            <!-- 邮件配置已移除 -->
+                        </div>
+                        
+                        <!-- 用户菜单已移除 -->
+                        
+                        <a href="#logout" class="sidebar-link text-danger mt-4" id="logout-link">
+                            <i class="bi bi-box-arrow-right"></i> 退出
+                        </a>
+                    </nav>
+                </div>
+
+                <!-- 内容区域 -->
+                <div class="col-md-10 p-0">
+                    <!-- 标题栏 -->
+                    <div class="title-bar d-flex justify-content-between align-items-center">
+                        <h4 class="mb-0" id="page-title">控制台</h4>
+                        <div>
+                            <span id="user-role-badge" class="badge bg-primary me-2 d-none">普通用户</span>
+                            <span id="admin-role-badge" class="badge bg-danger me-2 d-none">管理员</span>
+                            <a href="/" class="btn btn-sm btn-outline-primary">
+                                <i class="bi bi-house"></i> 返回主页
+                            </a>
+                        </div>
+                    </div>
+
+                    <!-- 内容页面 -->
+                    <div class="content">
+                        <!-- 系统概览页面 -->
+                        <div id="dashboard-page" class="page-content">
+                            <div class="row">
+                                <div class="col-md-3">
+                                    <div class="stats-card bg-info-light">
+                                        <div class="icon-container mb-2">
+                                            <i class="bi bi-people-fill" style="font-size: 2rem; color: var(--primary-color);"></i>
+                                        </div>
+                                        <div class="stats-number" id="total-users">0</div>
+                                        <div class="mt-2 fw-bold">注册用户</div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="stats-card bg-success-light">
+                                        <div class="icon-container mb-2">
+                                            <i class="bi bi-key-fill" style="font-size: 2rem; color: var(--primary-color);"></i>
+                                        </div>
+                                        <div class="stats-number" id="total-appids">0</div>
+                                        <div class="mt-2 fw-bold">AppID数量</div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="stats-card bg-warning-light">
+                                        <div class="icon-container mb-2">
+                                            <i class="bi bi-lightning-fill" style="font-size: 2rem; color: var(--primary-color);"></i>
+                                        </div>
+                                        <div class="stats-number" id="total-ws">0</div>
+                                        <div class="mt-2 fw-bold">WebSocket转发</div>
+                                    </div>
+                                </div>
+                                <div class="col-md-3">
+                                    <div class="stats-card bg-danger-light">
+                                        <div class="icon-container mb-2">
+                                            <i class="bi bi-arrow-repeat" style="font-size: 2rem; color: var(--primary-color);"></i>
+                                        </div>
+                                        <div class="stats-number" id="total-wh">0</div>
+                                        <div class="mt-2 fw-bold">Webhook转发</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <!-- 黑名单管理卡片已移到最下方 -->
+
+                            <div class="panel-card mt-4">
+                                <div class="panel-header d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-activity me-2"></i>系统运行状态
+                                    </div>
+                                    <div>
+                                        <small class="text-muted">实时数据</small>
+                                    </div>
+                                </div>
+                                <div class="panel-body">
+                                    <div class="table-responsive mt-3">
+                                        <h5 class="mb-3"><i class="bi bi-arrow-repeat me-2"></i>Webhook转发配置</h5>
+                                        <table class="table table-striped table-bordered table-hover" id="dashboard-webhook-config-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>密钥</th>
+                                                    <th>转发URL</th>
+                                                    <th>状态</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="dashboard-webhook-config-body">
+                                                <!-- 转发配置将通过JS动态加载 -->
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    
+                                    <div class="mt-4">
+                                        <h5 class="mb-3"><i class="bi bi-bar-chart-fill me-2"></i>连接统计</h5>
+                                        <div class="table-responsive">
+                                            <table class="table table-striped table-bordered table-hover" id="dashboard-connection-stats-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th>密钥</th>
+                                                        <th>WebSocket连接数</th>
+                                                        <th>Webhook推送数</th>
+                                                        <th>WebSocket成功</th>
+                                                        <th>WebSocket失败</th>
+                                                        <th>Webhook成功</th>
+                                                        <th>Webhook失败</th>
+                                                        <th>操作</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody id="dashboard-connection-stats-body">
+                                                    <!-- 连接统计将通过JS动态加载 -->
+                                                </tbody>
+                                            </table>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- 添加黑名单管理卡片 -->
+                            <div class="panel-card mt-4">
+                                <div class="panel-header d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-shield-slash me-2"></i>密钥黑名单
+                                    </div>
+                                    <div>
+                                        <div class="form-check form-switch">
+                                            <input class="form-check-input" type="checkbox" id="blacklist-enabled" checked>
+                                            <label class="form-check-label" for="blacklist-enabled">启用黑名单</label>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="panel-body">
+                                    <div class="row mb-3">
+                                        <div class="col-md-8">
+                                            <div class="input-group">
+                                                <input type="text" class="form-control" id="blacklist-secret" placeholder="输入要拉黑的密钥">
+                                                <button class="btn btn-danger" type="button" id="add-to-blacklist">
+                                                    <i class="bi bi-shield-fill-x"></i> 添加到黑名单
+                                                </button>
+                                            </div>
+                                            <small class="text-muted">添加到黑名单的密钥将无法建立WebSocket连接</small>
+                                        </div>
+                                    </div>
+                                    
+                                    <div class="table-responsive mt-3">
+                                        <table class="table table-striped table-hover" id="blacklist-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>密钥</th>
+                                                    <th>操作</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="blacklist-table-body">
+                                                <!-- 黑名单列表将通过JS动态加载 -->
+                                            </tbody>
+                                        </table>
+                                        <div class="text-center text-secondary py-5" id="no-blacklist">
+                                            <i class="bi bi-shield-check" style="font-size: 3rem; opacity: 0.3;"></i>
+                                            <p class="mt-3">黑名单中暂无密钥</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 用户管理页面 -->
+                        <div id="users-page" class="page-content hidden">
+                            <div class="panel-card">
+                                <div class="panel-header d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-people me-2"></i>用户列表
+                                    </div>
+                                    <div>
+                                        <button class="btn btn-sm btn-outline-primary" id="refresh-users-btn">
+                                            <i class="bi bi-arrow-clockwise"></i> 刷新
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="panel-body">
+                                    <div class="table-responsive">
+                                        <table class="table table-striped table-hover" id="users-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>#</th>
+                                                    <th>用户名</th>
+                                                    <th>注册时间</th>
+                                                    <th>最后登录</th>
+                                                    <th>短密钥数量</th>
+                                                    <th>操作</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="users-table-body">
+                                                <!-- 用户数据将通过JS动态加载 -->
+                                            </tbody>
+                                        </table>
+                                        <div class="text-center text-secondary py-5" id="no-users">
+                                            <i class="bi bi-person-x" style="font-size: 3rem; opacity: 0.3;"></i>
+                                            <p class="mt-3">暂无用户数据</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+
+
+                        <!-- 系统配置页面 -->
+                        <div id="settings-page" class="page-content hidden">
+                            <div class="panel-card">
+                                <div class="panel-header">
+                                    系统设置
+                                </div>
+                                <div class="panel-body">
+                                    <form id="settings-form">
+                                        <div class="mb-3">
+                                            <label for="log-level" class="form-label">日志级别</label>
+                                            <select class="form-select" id="log-level">
+                                                <option value="DEBUG">DEBUG</option>
+                                                <option value="INFO">INFO</option>
+                                                <option value="WARNING">WARNING</option>
+                                                <option value="ERROR">ERROR</option>
+                                            </select>
+                                        </div>
+
+                                        <div class="mb-3">
+                                            <label for="deduplication-ttl" class="form-label">消息去重时间(秒)</label>
+                                            <input type="number" class="form-control" id="deduplication-ttl" min="0">
+                                        </div>
+
+                                        <div class="mb-3 form-check">
+                                            <input type="checkbox" class="form-check-input" id="raw-content-enabled">
+                                            <label class="form-check-label" for="raw-content-enabled">启用原始内容记录</label>
+                                        </div>
+
+                                        <div class="mb-3">
+                                            <label for="raw-content-path" class="form-label">原始内容记录路径</label>
+                                            <input type="text" class="form-control" id="raw-content-path">
+                                        </div>
+
+                                        <button type="submit" class="btn btn-primary">保存设置</button>
+                                    </form>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- 邮件配置页面已移除 -->
+                        
+                        <!-- 用户相关页面已移除 -->
+                        
+                        <!-- 权限限制提示页面 -->
+                        <div id="permission-denied-page" class="page-content hidden">
+                            <div class="alert alert-danger">
+                                <h4 class="alert-heading"><i class="bi bi-exclamation-triangle-fill me-2"></i>无权访问</h4>
+                                <p>您没有权限访问此功能，该功能仅管理员可用。</p>
+                                <hr>
+                                <p class="mb-0">如需更多帮助，请联系系统管理员。</p>
+                            </div>
+                        </div>
+
+                        <!-- AppID管理页面 -->
+                        <div id="appids-page" class="page-content hidden">
+                            <div class="panel-card">
+                                <div class="panel-header d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-key me-2"></i>创建AppID
+                                    </div>
+                                </div>
+                                <div class="panel-body">
+                                    <form id="create-appid-form" action="/api/admin/create_appid" method="get">
+                                        <input type="hidden" id="admin-token-field" name="token" value="">
+                                        <div class="row">
+                                            <div class="col-md-4">
+                                                <div class="mb-3 mb-md-0">
+                                                <label for="create-appid" class="form-label">AppID</label>
+                                                <input type="text" class="form-control" id="create-appid" name="appid" placeholder="请输入AppID" maxlength="64" required>
+                                                    <div class="form-text">应用的唯一标识</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-4">
+                                                <div class="mb-3 mb-md-0">
+                                                <label for="create-secret" class="form-label">密钥</label>
+                                                <input type="text" class="form-control" id="create-secret" name="secret" placeholder="请输入密钥" maxlength="64" required minlength="10">
+                                                    <div class="form-text">用于验证请求，至少10个字符</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-md-4">
+                                                <div class="mb-3 mb-md-0">
+                                                <label for="create-description" class="form-label">描述</label>
+                                                <input type="text" class="form-control" id="create-description" name="description" placeholder="请输入描述（可选）" maxlength="100">
+                                                    <div class="form-text">可选，记录AppID用途</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="text-end mt-3">
+                                        <input type="submit" id="create-appid-button" class="btn btn-primary" value="创建AppID">
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+
+                            <div class="panel-card">
+                                <div class="panel-header d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <i class="bi bi-list-ul me-2"></i>AppID列表
+                                    </div>
+                                    <div>
+                                        <button class="btn btn-sm btn-outline-primary" id="refresh-appids-btn">
+                                            <i class="bi bi-arrow-clockwise"></i> 刷新
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="panel-body">
+                                    <div class="table-responsive">
+                                        <table class="table table-striped table-hover" id="all-appids-table">
+                                            <thead>
+                                                <tr>
+                                                    <th>AppID</th>
+                                                    <th>密钥</th>
+                                                    <th>描述</th>
+                                                    <th>创建时间</th>
+                                                    <th>WebSocket转发</th>
+                                                    <th>Webhook转发</th>
+                                                    <th>开放平台验证链接</th>
+                                                    <th>操作</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="all-appids-table-body">
+                                                <!-- AppID数据将通过JS动态加载 -->
+                                            </tbody>
+                                        </table>
+                                        <div class="text-center text-secondary py-5" id="no-all-appids">
+                                            <i class="bi bi-key-fill" style="font-size: 3rem; opacity: 0.3;"></i>
+                                            <p class="mt-3">暂无AppID数据</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 模板区域开始 -->
+    <!-- 所有短密钥相关模板已移除 -->
+    <!-- 模板区域结束 -->
+
+    <!-- CSRF令牌隐藏输入 -->
+    <!-- CSRF令牌已移除 -->
+
+    <script>
+        // 全局变量
+        let adminToken = localStorage.getItem('adminToken');
+let csrfToken = '';
+        let systemStats = null;
+        let allUsers = [];
+        let sessionChecked = false; // 添加会话检查标志
+        let loginCheckInterval = null; // 定期检查登录状态的定时器
+        let isAdmin = true; // 管理员模式
+        let allAppIds = [];
+
+        // DOM加载完成后执行
+        document.addEventListener('DOMContentLoaded', function() {
+            // 检查登录状态
+            checkLoginStatus();
+            
+            // 表单验证
+            const forms = document.querySelectorAll('.needs-validation');
+            Array.from(forms).forEach(form => {
+                form.addEventListener('submit', function(event) {
+                    if (!form.checkValidity()) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                    }
+                    form.classList.add('was-validated');
+                }, false);
+            });
+            
+            // 登出按钮点击
+            document.getElementById('logout-link').addEventListener('click', function(e) {
+                e.preventDefault();
+                logout();
+            });
+            
+            // 导航切换
+            document.querySelectorAll('.sidebar-link[data-page]').forEach(link => {
+                link.addEventListener('click', function(e) {
+                    e.preventDefault();
+                    const pageId = this.getAttribute('data-page');
+                    switchPage(pageId);
+                });
+            });
+            
+            // 黑名单启用/禁用开关
+            document.getElementById('blacklist-enabled')?.addEventListener('change', function() {
+                toggleBlacklist(this.checked);
+            });
+            
+            // 添加到黑名单按钮
+            document.getElementById('add-to-blacklist')?.addEventListener('click', function() {
+                const secret = document.getElementById('blacklist-secret').value.trim();
+                if (secret) {
+                    addToBlacklist(secret);
+                    document.getElementById('blacklist-secret').value = '';
+                } else {
+                    showToast('错误', '请输入密钥', 'danger');
+                }
+            });
+            
+            // 系统设置表单提交
+            document.getElementById('settings-form').addEventListener('submit', function(e) {
+                e.preventDefault();
+                saveSettings();
+            });
+            
+            // 刷新用户列表按钮
+            document.getElementById('refresh-users-btn')?.addEventListener('click', function(e) {
+                e.preventDefault();
+                loadAllUsers();
+                
+                // 添加旋转动画
+                const icon = this.querySelector('i');
+                icon.classList.add('rotate-animation');
+                setTimeout(() => {
+                    icon.classList.remove('rotate-animation');
+                }, 1000);
+            });
+            
+            // 创建AppID按钮点击事件
+            document.getElementById('create-appid-button')?.addEventListener('click', function() {
+                const appid = document.getElementById('create-appid').value.trim();
+                const secret = document.getElementById('create-secret').value.trim();
+                const description = document.getElementById('create-description').value.trim();
+                
+                // 简单验证
+                if (!appid) {
+                    showToast('错误', 'AppID不能为空', 'danger');
+                    return;
+                }
+                
+                if (!secret || secret.length < 10) {
+                    showToast('错误', '密钥长度必须至少为10个字符', 'danger');
+                    return;
+                }
+                
+                // 发送创建请求
+                createAppIdRequest(appid, secret, description);
+            });
+            
+            // 初始化 CSRF 令牌
+            // CSRF令牌已移除
+            // CSRF令牌已移除
+            
+            // 初始化复制功能
+            document.addEventListener('click', function(e) {
+                if (e.target.closest('.copy-btn')) {
+                    const btn = e.target.closest('.copy-btn');
+                    const targetClass = btn.getAttribute('data-target');
+                    const input = btn.closest('.input-group').querySelector(`.${targetClass}`);
+                    if (input) {
+                        copyToClipboard(input.value);
+                        
+                        // 显示复制成功提示
+                        const originalHTML = btn.innerHTML;
+                        btn.innerHTML = '<i class="bi bi-check-lg"></i>';
+                        btn.disabled = true;
+                        
+                        setTimeout(() => {
+                            btn.innerHTML = originalHTML;
+                            btn.disabled = false;
+                        }, 1500);
+                    }
+                }
+            });
+        });
+
+        // 检查登录状态
+        function checkLoginStatus() {
+            // 检查是否有管理员令牌
+            if (adminToken) {
+                verifyAdminLogin();
+            } 
+            // 没有则重定向到登录页面
+            else {
+                window.location.href = '/login';
+            }
+        }
+        
+        // 验证管理员登录状态
+        function verifyAdminLogin() {
+            fetch('/api/admin/verify', {
+                headers: {
+                    'Authorization': `Bearer ${adminToken}`
+                }
+            })
+            .then(response => {
+                if (response.ok) {
+                    // 显示管理员面板
+                    document.getElementById('admin-panel').classList.remove('d-none');
+                    document.getElementById('admin-menu').classList.remove('d-none');
+                    
+                    // 设置为管理员
+                    isAdmin = true;
+                    document.getElementById('admin-role-badge').classList.remove('d-none');
+                    
+                    // 设置隐藏的令牌字段
+                    document.getElementById('admin-token-field').value = adminToken;
+                    
+                    // 加载系统数据
+                    loadSystemData();
+                    
+                    // 加载AppID列表
+                    loadAllAppIds();
+                    
+                    // 默认显示系统概览页面
+                    const dashboardPage = document.getElementById('dashboard-page');
+                    document.querySelectorAll('.page-content').forEach(page => {
+                        page.classList.add('hidden');
+                        page.classList.remove('active');
+                    });
+                    dashboardPage.classList.remove('hidden');
+                    
+                    // 更新标题和导航激活状态
+                    document.getElementById('page-title').textContent = '系统概览';
+                    document.querySelectorAll('.sidebar-link').forEach(link => {
+                        link.classList.remove('active');
+                    });
+                    document.querySelector('.sidebar-link[data-page="dashboard"]').classList.add('active');
+                    
+                    // 添加进入动画
+                    setTimeout(() => {
+                        dashboardPage.classList.add('active');
+                    }, 100);
+                    
+                    // 启动定期检查登录状态
+                    startLoginCheck('admin');
+                } else {
+                    // 无效令牌，清除并重定向到登录页面
+                    localStorage.removeItem('adminToken');
+                    adminToken = null;
+                        window.location.href = '/login';
+                }
+            })
+            .catch(error => {
+                console.error('验证管理员令牌出错:', error);
+                localStorage.removeItem('adminToken');
+                adminToken = null;
+                window.location.href = '/login';
+            });
+        }
+        
+        // 显示登录页面
+        function showLoginPage() {
+            document.getElementById('auth-page').classList.remove('d-none');
+            document.getElementById('admin-panel').classList.add('d-none');
+            document.getElementById('admin-role-badge').classList.add('d-none');
+        }
+        
+        // 显示管理员面板
+        function showAdminPanel() {
+            document.getElementById('auth-page').classList.add('d-none');
+            document.getElementById('admin-panel').classList.remove('d-none');
+            document.getElementById('admin-menu').classList.remove('d-none');
+        }
+        
+        // 启动定期检查登录状态
+        function startLoginCheck(userType) {
+            // 先立即检查一次
+            checkSessionStatus(userType);
+            
+            // 每60秒检查一次登录状态
+            loginCheckInterval = setInterval(() => {
+                checkSessionStatus(userType);
+            }, 60000);
+        }
+        
+        // 检查会话状态
+        function checkSessionStatus(userType) {
+            if (sessionChecked) return; // 防止重复检查
+            
+                // 检查管理员会话
+                fetch('/api/admin/verify', {
+                    headers: {
+                        'Authorization': `Bearer ${adminToken}`
+                    }
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        handleSessionExpired();
+                    }
+                })
+                .catch(err => {
+                    console.error('检查管理员登录状态出错:', err);
+                });
+        }
+        
+        // 处理会话过期
+        function handleSessionExpired() {
+            if (sessionChecked) return; // 防止多次弹窗
+            sessionChecked = true;
+            
+            console.log("检测到会话已过期，需要重新登录");
+            
+            // 停止定期检查
+            if (loginCheckInterval) {
+                clearInterval(loginCheckInterval);
+            }
+            
+            // 清除本地存储的凭证
+            localStorage.removeItem('adminToken');
+            adminToken = null;
+            
+            // 直接重定向到登录页面
+            window.location.href = '/login';
+        }
+        
+        // 显示错误信息
+        function showError(element, message) {
+            element.textContent = message;
+            element.classList.remove('d-none');
+            // 添加抖动效果
+            element.classList.add('animate__animated', 'animate__shakeX');
+            setTimeout(() => {
+                element.classList.remove('animate__animated', 'animate__shakeX');
+            }, 1000);
+        }
+
+        // 登出
+        function logout() {
+            if (!confirm('确定要退出登录吗？')) {
+                return;
+            }
+            
+            if (isAdmin && adminToken) {
+                // 管理员登出
+                fetch('/api/admin/logout', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${adminToken}`
+                    }
+                })
+                .catch(error => console.error('管理员登出错误:', error))
+                .finally(() => {
+                    // 清除本地存储
+                    localStorage.removeItem('adminToken');
+                    localStorage.removeItem('username');
+                    adminToken = null;
+                    currentUser = '';
+                    isAdmin = false;
+                    
+                    // 重新加载页面以重置状态
+                    window.location.reload();
+                });
+            } else if (userToken) {
+                // 用户登出
+                const formData = new FormData();
+                formData.append('csrf_token', csrfToken);
+                
+                fetch('/api/logout', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${userToken}`
+                    },
+                    body: formData
+                })
+                .catch(error => console.error('用户登出错误:', error))
+                .finally(() => {
+                    // 清除本地存储
+                    localStorage.removeItem('userToken');
+                    localStorage.removeItem('username');
+                    userToken = null;
+                    currentUser = '';
+                    
+                    // 重新加载页面以重置状态
+                    window.location.reload();
+                });
+            }
+        }
+
+        // 切换页面
+        function switchPage(pageId) {
+            // 检查权限
+            if (!checkPermission(pageId)) {
+                // 如果没有权限，显示权限限制页面
+                showPermissionDeniedPage();
+                return;
+            }
+            
+            // 隐藏所有页面
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.classList.remove('active');
+                setTimeout(() => {
+                    page.classList.add('hidden');
+                }, 300);
+            });
+            
+            // 显示选中的页面
+            setTimeout(() => {
+                const targetPage = document.getElementById(`${pageId}-page`);
+                if (!targetPage) {
+                    console.error(`页面 ${pageId}-page 不存在`);
+                    return;
+                }
+                
+                targetPage.classList.remove('hidden');
+                
+                // 触发重排，然后添加动画类
+                setTimeout(() => {
+                    targetPage.classList.add('active');
+                }, 50);
+                
+                // 更新标题
+                let title = '系统概览';
+                if (pageId === 'users') title = '用户管理';
+                else if (pageId === 'shortkeys') title = '短密钥管理';
+                else if (pageId === 'settings') title = '系统配置';
+                else if (pageId === 'email') title = '邮件配置';
+                else if (pageId === 'user-dashboard') title = '仪表盘';
+                else if (pageId === 'user-keys') title = '密钥管理';
+                else if (pageId === 'appids') title = 'AppID管理';
+                document.getElementById('page-title').textContent = title;
+                
+                // 更新导航激活状态
+                document.querySelectorAll('.sidebar-link').forEach(link => {
+                    link.classList.remove('active');
+                });
+                document.querySelector(`.sidebar-link[data-page="${pageId}"]`)?.classList.add('active');
+                
+                // 根据页面类型加载数据
+                if (pageId === 'users') {
+                    loadAllUsers();
+                } else if (pageId === 'shortkeys') {
+                    loadAllShortkeys();
+                } else if (pageId === 'settings') {
+                    loadSystemSettings();
+                } else if (pageId === 'email') {
+                    loadEmailSettings();
+                } else if (pageId === 'user-keys') {
+                    loadUserShortKeys();
+                } else if (pageId === 'appids') {
+                    loadAllAppIds();
+                }
+            }, 300);
+        }
+        
+        // 检查页面访问权限
+        function checkPermission(pageId) {
+            // 管理员页面列表
+            const adminPages = ['dashboard', 'users', 'shortkeys', 'settings', 'email', 'appids'];
+            // 用户页面列表
+            const userPages = ['user-dashboard', 'user-keys'];
+            
+            // 管理员可以访问所有页面
+            if (isAdmin) {
+                return true;
+            }
+            
+            // 非管理员只能访问用户页面
+            if (userPages.includes(pageId)) {
+                return true;
+            }
+            
+            return false;
+        }
+        
+        // 显示权限限制页面
+        function showPermissionDeniedPage() {
+            // 隐藏所有页面
+            document.querySelectorAll('.page-content').forEach(page => {
+                page.classList.remove('active');
+                page.classList.add('hidden');
+            });
+            
+            // 显示权限限制页面
+            const permissionDeniedPage = document.getElementById('permission-denied-page');
+            permissionDeniedPage.classList.remove('hidden');
+            
+            // 触发重排，然后添加动画类
+            setTimeout(() => {
+                permissionDeniedPage.classList.add('active');
+            }, 50);
+            
+            // 更新标题
+            document.getElementById('page-title').textContent = '权限不足';
+            
+            // 更新导航激活状态
+            document.querySelectorAll('.sidebar-link').forEach(link => {
+                link.classList.remove('active');
+            });
+        }
+
+        // 加载系统数据
+        function loadSystemData() {
+            fetchWithAuth('/api/admin/stats')
+            .then(response => response.json())
+            .then(data => {
+                systemStats = data;
+                updateDashboard();
+                
+                // 加载黑名单数据
+                loadBlacklist();
+            })
+            .catch(error => {
+                console.error('加载系统数据出错:', error);
+            });
+        }
+
+        // 加载黑名单数据
+        function loadBlacklist() {
+            fetchWithAuth('/api/admin/blacklist')
+            .then(response => response.json())
+            .then(data => {
+                displayBlacklist(data);
+            })
+            .catch(error => {
+                console.error('加载黑名单数据出错:', error);
+            });
+        }
+        
+        // 显示黑名单数据
+        function displayBlacklist(blacklist) {
+            const tableBody = document.getElementById('blacklist-table-body');
+            const noBlacklist = document.getElementById('no-blacklist');
+            const blacklistEnabled = document.getElementById('blacklist-enabled');
+            
+            // 设置黑名单开关状态
+            blacklistEnabled.checked = blacklist.enabled;
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            if (blacklist.secrets && blacklist.secrets.length > 0) {
+                noBlacklist.style.display = 'none';
+                
+                blacklist.secrets.forEach(secret => {
+                    const row = document.createElement('tr');
+                    
+                    // 密钥
+                    const secretCell = document.createElement('td');
+                    secretCell.textContent = secret;
+                    secretCell.style.fontFamily = 'monospace';
+                    row.appendChild(secretCell);
+                    
+                    // 操作
+                    const actionCell = document.createElement('td');
+                    
+                    const removeBtn = document.createElement('button');
+                    removeBtn.classList.add('btn', 'btn-sm', 'btn-success');
+                    removeBtn.innerHTML = '<i class="bi bi-shield-check"></i> 解除拉黑';
+                    removeBtn.addEventListener('click', () => {
+                        removeFromBlacklist(secret);
+                    });
+                    actionCell.appendChild(removeBtn);
+                    
+                    row.appendChild(actionCell);
+                    tableBody.appendChild(row);
+                });
+            } else {
+                noBlacklist.style.display = 'block';
+            }
+        }
+        
+        // 添加密钥到黑名单
+        function addToBlacklist(secret) {
+            fetchWithAuth('/api/admin/blacklist/add', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ secret: secret })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', data.message, 'success');
+                    
+                    // 重新加载黑名单和系统数据
+                    loadBlacklist();
+                    loadSystemData();
+                } else {
+                    showToast('错误', data.message || '添加到黑名单失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('添加到黑名单出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+            });
+        }
+        
+        // 从黑名单移除密钥
+        function removeFromBlacklist(secret) {
+            fetchWithAuth('/api/admin/blacklist/remove', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ secret: secret })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', data.message, 'success');
+                    
+                    // 重新加载黑名单和系统数据
+                    loadBlacklist();
+                    loadSystemData();
+                } else {
+                    showToast('错误', data.message || '从黑名单移除失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('从黑名单移除出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+            });
+        }
+        
+        // 启用/禁用黑名单
+        function toggleBlacklist(enabled) {
+            fetchWithAuth('/api/admin/blacklist/toggle', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ enabled: enabled })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', data.message, 'success');
+                } else {
+                    showToast('错误', data.message || '切换黑名单状态失败', 'danger');
+                    // 恢复开关状态
+                    document.getElementById('blacklist-enabled').checked = !enabled;
+                }
+            })
+            .catch(error => {
+                console.error('切换黑名单状态出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+                // 恢复开关状态
+                document.getElementById('blacklist-enabled').checked = !enabled;
+            });
+        }
+
+        // 更新仪表盘
+        function updateDashboard() {
+            if (!systemStats) return;
+            
+            document.getElementById('total-users').textContent = systemStats.total_users || 0;
+            document.getElementById('total-appids').textContent = systemStats.total_appids || 0;
+            document.getElementById('total-ws').textContent = systemStats.ws?.total_success || 0;
+            document.getElementById('total-wh').textContent = systemStats.wh?.total_success || 0;
+            
+            // 显示仪表盘上的Webhook转发配置
+            displayWebhookConfig(systemStats.forward_config, systemStats.webhook_enabled, 'dashboard-webhook-config-body');
+            
+            // 显示仪表盘上的连接统计
+            displayConnectionStats(systemStats, 'dashboard-connection-stats-body');
+        }
+
+        // 加载所有用户
+        function loadAllUsers() {
+            fetchWithAuth('/api/admin/users')
+            .then(response => response.json())
+            .then(users => {
+                allUsers = users;
+                displayUsers();
+            })
+            .catch(error => {
+                console.error('加载用户数据出错:', error);
+            });
+        }
+
+        // 显示用户列表
+        function displayUsers() {
+            const tableBody = document.getElementById('users-table-body');
+            const noUsers = document.getElementById('no-users');
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            if (allUsers && allUsers.length > 0) {
+                noUsers.style.display = 'none';
+                
+                allUsers.forEach((user, index) => {
+                    const row = document.createElement('tr');
+                    
+                    // 序号
+                    const indexCell = document.createElement('td');
+                    indexCell.textContent = index + 1;
+                    row.appendChild(indexCell);
+                    
+                    // 用户名
+                    const usernameCell = document.createElement('td');
+                    usernameCell.textContent = user.username;
+                    usernameCell.classList.add('user-name');
+                    row.appendChild(usernameCell);
+                    
+                    // 注册时间
+                    const registerTimeCell = document.createElement('td');
+                    registerTimeCell.textContent = formatDate(user.create_time * 1000);
+                    row.appendChild(registerTimeCell);
+                    
+                    // 最后登录
+                    const lastLoginCell = document.createElement('td');
+                    lastLoginCell.textContent = user.last_login ? formatDate(user.last_login * 1000) : '从未登录';
+                    row.appendChild(lastLoginCell);
+                    
+                    // 短密钥数量
+                    const keysCountCell = document.createElement('td');
+                    keysCountCell.textContent = user.keys_count || 0;
+                    row.appendChild(keysCountCell);
+                    
+                    // 操作
+                    const actionCell = document.createElement('td');
+                    
+                    const viewBtn = document.createElement('button');
+                    viewBtn.classList.add('btn', 'btn-sm', 'btn-primary', 'me-1');
+                    viewBtn.innerHTML = '<i class="bi bi-eye"></i>';
+                    viewBtn.title = '查看详情';
+                    viewBtn.addEventListener('click', () => viewUserDetails(user.username));
+                    actionCell.appendChild(viewBtn);
+                    
+                    const resetBtn = document.createElement('button');
+                    resetBtn.classList.add('btn', 'btn-sm', 'btn-warning', 'me-1');
+                    resetBtn.innerHTML = '<i class="bi bi-key"></i>';
+                    resetBtn.title = '重置密码';
+                    resetBtn.addEventListener('click', () => resetUserPassword(user.username));
+                    actionCell.appendChild(resetBtn);
+                    
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.classList.add('btn', 'btn-sm', 'btn-danger');
+                    deleteBtn.innerHTML = '<i class="bi bi-trash"></i>';
+                    deleteBtn.title = '删除用户';
+                    deleteBtn.addEventListener('click', () => deleteUser(user.username));
+                    actionCell.appendChild(deleteBtn);
+                    
+                    row.appendChild(actionCell);
+                    
+                    tableBody.appendChild(row);
+                });
+                
+                // 更新用户选择下拉框
+                updateUserSelectOptions();
+            } else {
+                noUsers.style.display = 'block';
+            }
+        }
+
+        // 更新用户选择下拉框
+        function updateUserSelectOptions() {
+            const userSelect = document.getElementById('shortkey-username');
+            if (userSelect) {
+                // 清空现有选项，保留默认选项
+                while (userSelect.options.length > 1) {
+                    userSelect.remove(1);
+                }
+                
+                // 添加用户选项
+                if (allUsers) {
+                    allUsers.forEach(user => {
+                        const option = document.createElement('option');
+                        option.value = escapeHTML(user.username);
+                        option.textContent = escapeHTML(user.username);
+                        userSelect.appendChild(option);
+                    });
+                }
+            }
+        }
+
+        // 查看用户详情
+        function viewUserDetails(username) {
+            // 尝试不同的API路径，因为后端可能有多种实现
+            fetchWithAuth(`/api/admin/user/${encodeURIComponent(username)}/keys`)
+            .then(response => {
+                if (!response.ok) {
+                    // 尝试备用路径
+                    return fetchWithAuth(`/api/admin/users/${encodeURIComponent(username)}/shortkeys`)
+                        .then(altResponse => {
+                            if (!altResponse.ok) {
+                                throw new Error(`HTTP error! status: ${altResponse.status}`);
+                            }
+                            return altResponse.json();
+                        });
+                }
+                return response.json();
+            })
+            .then(data => {
+                // 显示用户详情和短密钥列表
+                const userShortkeys = data;
+                
+                // 如果数据为空，尝试再次获取完整数据
+                if (userShortkeys.length > 0 && !userShortkeys[0].secret) {
+                    // 尝试不同的API路径获取完整数据
+                    fetchWithAuth(`/api/admin/user/${encodeURIComponent(username)}/keys?include_secrets=true`)
+                    .then(response => {
+                        if (!response.ok) {
+                            // 尝试备用路径
+                            return fetchWithAuth(`/api/admin/users/${encodeURIComponent(username)}/shortkeys?include_secrets=true`);
+                        }
+                        return response;
+                    })
+                    .then(response => {
+                        if (!response.ok) {
+                            throw new Error(`HTTP error! status: ${response.status}`);
+                        }
+                        return response.json();
+                    })
+                    .then(fullData => {
+                        if (fullData && fullData.length > 0) {
+                            createUserDetailsModal(username, fullData);
+                        } else {
+                            createUserDetailsModal(username, userShortkeys);
+                        }
+                    })
+                    .catch(error => {
+                        console.error('获取完整用户详情出错:', error);
+                        createUserDetailsModal(username, userShortkeys);
+                    });
+                } else {
+                    createUserDetailsModal(username, userShortkeys);
+                }
+            })
+            .catch(error => {
+                console.error('获取用户详情出错:', error);
+                alert(`获取用户详情失败: ${error.message}`);
+            });
+        }
+
+        // 创建用户详情模态框
+        function createUserDetailsModal(username, userShortkeys) {
+                // 创建模态框
+                const modal = document.createElement('div');
+                modal.classList.add('modal', 'fade');
+                modal.id = 'userDetailsModal';
+                modal.tabIndex = -1;
+                modal.setAttribute('aria-labelledby', 'userDetailsModalLabel');
+                modal.setAttribute('aria-hidden', 'true');
+                
+                modal.innerHTML = `
+                    <div class="modal-dialog modal-lg">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title" id="userDetailsModalLabel">用户详情: ${escapeHTML(username)}</h5>
+                                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                            </div>
+                            <div class="modal-body">
+                                <h6>短密钥列表</h6>
+                                <div class="table-responsive">
+                                    <table class="table table-striped table-bordered">
+                                        <thead>
+                                            <tr>
+                                                <th>短密钥</th>
+                                                <th>原始密钥</th>
+                                                <th>创建时间</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            ${userShortkeys.length > 0 ? 
+                                                userShortkeys.map(key => `
+                                                    <tr>
+                                                        <td>${escapeHTML(key.short_key)}</td>
+                                                    <td>${key.secret ? escapeHTML(key.secret) : '<span class="text-muted">密钥已脱敏，请联系用户获取原始密钥</span>'}</td>
+                                                        <td>${formatDate(key.create_time * 1000)}</td>
+                                                    </tr>
+                                                `).join('') : 
+                                                '<tr><td colspan="3" class="text-center">暂无短密钥</td></tr>'
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                
+                document.body.appendChild(modal);
+                
+                // 显示模态框
+                const modalInstance = new bootstrap.Modal(modal);
+                modalInstance.show();
+                
+                // 模态框关闭后移除DOM
+                modal.addEventListener('hidden.bs.modal', function () {
+                    document.body.removeChild(modal);
+            });
+        }
+
+        // 重置用户密码
+        function resetUserPassword(username) {
+            // 创建密码重置模态框
+            const modal = document.createElement('div');
+            modal.classList.add('modal', 'fade');
+            modal.id = 'resetPasswordModal';
+            modal.tabIndex = -1;
+            modal.setAttribute('aria-labelledby', 'resetPasswordModalLabel');
+            modal.setAttribute('aria-hidden', 'true');
+            
+            modal.innerHTML = `
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="resetPasswordModalLabel">重置用户 ${escapeHTML(username)} 的密码</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                        </div>
+                        <div class="modal-body">
+                            <form id="reset-password-form">
+                                <div class="mb-3">
+                                    <label for="new-password" class="form-label">新密码</label>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control" id="new-password" required minlength="6" 
+                                            placeholder="输入新密码或自动生成">
+                                        <button class="btn btn-outline-secondary" type="button" id="generate-password">
+                                            生成密码
+                                        </button>
+                                    </div>
+                                    <div class="form-text">密码长度至少6个字符</div>
+                                </div>
+                            </form>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
+                            <button type="button" class="btn btn-primary" id="confirm-reset">确认重置</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+            
+            // 显示模态框
+            const modalInstance = new bootstrap.Modal(modal);
+            modalInstance.show();
+            
+            // 生成随机密码
+            document.getElementById('generate-password').addEventListener('click', function() {
+                const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()';
+                let password = '';
+                for (let i = 0; i < 12; i++) {
+                    password += chars.charAt(Math.floor(Math.random() * chars.length));
+                }
+                document.getElementById('new-password').value = password;
+            });
+            
+            // 确认重置密码
+            document.getElementById('confirm-reset').addEventListener('click', function() {
+                const newPassword = document.getElementById('new-password').value.trim();
+                
+                if (newPassword.length < 6) {
+                    alert('密码长度至少6个字符');
+                return;
+            }
+            
+                // 发送重置密码请求
+            fetchWithAuth(`/api/admin/users/${encodeURIComponent(username)}/reset-password`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        new_password: newPassword,
+                        use_custom_password: true
+                    })
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
+                    }
+                    return response.json();
+                })
+            .then(data => {
+                if (data.status === 'success') {
+                        // 创建结果模态框
+                        modalInstance.hide();
+                        
+                        // 创建结果模态框
+                        const resultModal = document.createElement('div');
+                        resultModal.classList.add('modal', 'fade');
+                        resultModal.id = 'passwordResultModal';
+                        resultModal.tabIndex = -1;
+                        
+                        resultModal.innerHTML = `
+                            <div class="modal-dialog">
+                                <div class="modal-content">
+                                    <div class="modal-header">
+                                        <h5 class="modal-title">密码重置成功</h5>
+                                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                                    </div>
+                                    <div class="modal-body">
+                                        <p>用户 ${escapeHTML(data.username)} 的密码已重置为:</p>
+                                        <div class="input-group mb-3">
+                                            <input type="text" class="form-control" value="${escapeHTML(newPassword)}" id="result-password" readonly>
+                                            <button class="btn btn-outline-primary" type="button" id="copy-password">
+                                                <i class="bi bi-clipboard"></i> 复制
+                                            </button>
+                                        </div>
+                                        <div class="alert alert-warning">
+                                            <i class="bi bi-exclamation-triangle"></i> 请记录此密码，它不会再次显示！
+                                        </div>
+                                    </div>
+                                    <div class="modal-footer">
+                                        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">确定</button>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                        
+                        document.body.appendChild(resultModal);
+                        
+                        // 显示结果模态框
+                        const resultModalInstance = new bootstrap.Modal(resultModal);
+                        resultModalInstance.show();
+                        
+                        // 复制密码功能
+                        document.getElementById('copy-password').addEventListener('click', function() {
+                            const passwordField = document.getElementById('result-password');
+                            passwordField.select();
+                            document.execCommand('copy');
+                            this.innerHTML = '<i class="bi bi-check"></i> 已复制';
+                            setTimeout(() => {
+                                this.innerHTML = '<i class="bi bi-clipboard"></i> 复制';
+                            }, 2000);
+                        });
+                        
+                        // 结果模态框关闭后移除DOM
+                        resultModal.addEventListener('hidden.bs.modal', function() {
+                            document.body.removeChild(resultModal);
+                        });
+                } else {
+                    alert(data.message || '重置密码失败');
+                }
+            })
+            .catch(error => {
+                console.error('重置密码出错:', error);
+                    alert(`重置密码失败: ${error.message}`);
+                });
+            });
+            
+            // 模态框关闭后移除DOM
+            modal.addEventListener('hidden.bs.modal', function() {
+                document.body.removeChild(modal);
+            });
+        }
+
+        // 删除用户
+        function deleteUser(username) {
+            if (!confirm(`确定要删除用户 ${username} 吗？此操作将删除该用户的所有短密钥！`)) {
+                return;
+            }
+            
+            fetchWithAuth(`/api/admin/users/${encodeURIComponent(username)}`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    alert(`用户 ${data.username} 已成功删除，共删除 ${data.deleted_keys} 个短密钥`);
+                    loadAllUsers();  // 重新加载用户列表
+                    loadSystemData();  // 更新系统统计
+                } else {
+                    alert(data.message || '删除用户失败');
+                }
+            })
+            .catch(error => {
+                console.error('删除用户出错:', error);
+                alert('网络错误，请稍后再试');
+            });
+        }
+
+        // 加载所有短密钥
+        function loadAllShortkeys() {
+            fetchWithAuth('/api/admin/shortkeys')
+            .then(response => response.json())
+            .then(shortkeys => {
+                allShortkeys = shortkeys;
+                displayAllShortkeys();
+            })
+            .catch(error => {
+                console.error('加载短密钥数据出错:', error);
+            });
+        }
+
+        // 显示所有短密钥
+        function displayAllShortkeys() {
+            const tableBody = document.getElementById('all-shortkeys-table-body');
+            const noShortkeys = document.getElementById('no-all-shortkeys');
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            if (allShortkeys && allShortkeys.length > 0) {
+                noShortkeys.style.display = 'none';
+                
+                // 获取当前域名和协议
+                const protocol = window.location.protocol;
+                const host = window.location.host;
+                
+                allShortkeys.forEach(key => {
+                    const row = document.createElement('tr');
+                    
+                    // 短密钥
+                    const shortKeyCell = document.createElement('td');
+                    shortKeyCell.textContent = key.short_key;
+                    shortKeyCell.style.fontWeight = 'bold';
+                    row.appendChild(shortKeyCell);
+                    
+                    // 原密钥
+                    const secretCell = document.createElement('td');
+                    secretCell.textContent = key.secret;
+                    secretCell.style.fontFamily = 'monospace';
+                    secretCell.style.fontSize = '0.85rem';
+                    row.appendChild(secretCell);
+                    
+                    // 所属用户
+                    const usernameCell = document.createElement('td');
+                    usernameCell.textContent = key.username;
+                    row.appendChild(usernameCell);
+                    
+                    // 创建时间
+                    const createTimeCell = document.createElement('td');
+                    createTimeCell.textContent = formatDate(key.create_time * 1000);
+                    row.appendChild(createTimeCell);
+                    
+                    // WebSocket转发
+                    const wsCell = document.createElement('td');
+                    wsCell.textContent = `${key.ws?.success || 0} / ${key.ws?.failure || 0}`;
+                    row.appendChild(wsCell);
+                    
+                    // Webhook转发
+                    const whCell = document.createElement('td');
+                    whCell.textContent = `${key.wh?.success || 0} / ${key.wh?.failure || 0}`;
+                    row.appendChild(whCell);
+                    
+                    // 操作
+                    const actionCell = document.createElement('td');
+                    
+                    // 复制短密钥地址按钮
+                    const copyWsBtn = document.createElement('button');
+                    copyWsBtn.classList.add('btn', 'btn-sm', 'btn-info', 'me-1');
+                    copyWsBtn.innerHTML = '<i class="bi bi-clipboard"></i> WS';
+                    copyWsBtn.title = "复制WebSocket地址";
+                    copyWsBtn.addEventListener('click', () => {
+                        const wsUrl = `${protocol === 'https:' ? 'wss:' : 'ws:'}//${host}/sc/${key.short_key}`;
+                        copyToClipboard(wsUrl);
+                        
+                        copyWsBtn.innerHTML = '<i class="bi bi-check"></i> WS';
+                        setTimeout(() => {
+                            copyWsBtn.innerHTML = '<i class="bi bi-clipboard"></i> WS';
+                        }, 1500);
+                    });
+                    actionCell.appendChild(copyWsBtn);
+                    
+                    // 复制Webhook按钮
+                    const copyWebhookBtn = document.createElement('button');
+                    copyWebhookBtn.classList.add('btn', 'btn-sm', 'btn-secondary', 'me-1');
+                    copyWebhookBtn.innerHTML = '<i class="bi bi-clipboard"></i> WH';
+                    copyWebhookBtn.title = "复制Webhook地址";
+                    copyWebhookBtn.addEventListener('click', () => {
+                        const webhookUrl = `${protocol}//${host}/sc/${key.short_key}`;
+                        copyToClipboard(webhookUrl);
+                        
+                        copyWebhookBtn.innerHTML = '<i class="bi bi-check"></i> WH';
+                        setTimeout(() => {
+                            copyWebhookBtn.innerHTML = '<i class="bi bi-clipboard"></i> WH';
+                        }, 1500);
+                    });
+                    actionCell.appendChild(copyWebhookBtn);
+                    
+                    // 删除按钮
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.classList.add('btn', 'btn-sm', 'btn-danger');
+                    deleteBtn.innerHTML = '<i class="bi bi-trash"></i>';
+                    deleteBtn.title = "删除短密钥";
+                    deleteBtn.addEventListener('click', () => deleteShortKey(key.short_key));
+                    actionCell.appendChild(deleteBtn);
+                    
+                    row.appendChild(actionCell);
+                    
+                    tableBody.appendChild(row);
+                });
+            } else {
+                noShortkeys.style.display = 'block';
+            }
+        }
+
+        // 删除短密钥
+        function deleteShortKey(shortKey) {
+            if (!confirm(`确定要删除短密钥 ${shortKey} 吗？`)) {
+                return;
+            }
+            
+            fetchWithAuth(`/api/admin/shortkeys/${encodeURIComponent(shortKey)}`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', `短密钥 ${shortKey} 已成功删除`, 'success');
+                    loadAllShortkeys();  // 重新加载短密钥列表
+                    loadSystemData();  // 更新系统统计
+                } else {
+                    showToast('错误', data.message || '删除短密钥失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('删除短密钥出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+            });
+        }
+
+        // 加载系统设置
+        function loadSystemSettings() {
+            fetchWithAuth('/api/admin/settings')
+            .then(response => response.json())
+            .then(settings => {
+                // 填充表单
+                document.getElementById('log-level').value = settings.log_level || 'INFO';
+                document.getElementById('deduplication-ttl').value = settings.deduplication_ttl || 20;
+                document.getElementById('raw-content-enabled').checked = settings.raw_content?.enabled || false;
+                document.getElementById('raw-content-path').value = settings.raw_content?.path || 'logs';
+            })
+            .catch(error => {
+                console.error('加载系统设置出错:', error);
+            });
+        }
+
+        // 保存系统设置
+        function saveSettings() {
+            // 获取表单数据
+            const logLevel = document.getElementById('log-level').value;
+            const deduplicationTtl = parseInt(document.getElementById('deduplication-ttl').value) || 20;
+            const rawContentEnabled = document.getElementById('raw-content-enabled').checked;
+            const rawContentPath = document.getElementById('raw-content-path').value.trim();
+            
+            // 基本前端验证
+            if (!['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(logLevel)) {
+                showToast('错误', '无效的日志级别', 'danger');
+                return;
+            }
+            
+            if (deduplicationTtl < 0 || deduplicationTtl > 3600) {
+                showToast('错误', '去重时间必须在0-3600秒之间', 'danger');
+                return;
+            }
+            
+            // 验证路径格式（简单前端验证）
+            if (rawContentPath.includes('..') || rawContentPath.startsWith('/') || rawContentPath.includes(':')) {
+                showToast('错误', '不允许的路径格式', 'danger');
+                return;
+            }
+            
+            // 构建经过验证的设置对象
+            const settings = {
+                log_level: logLevel,
+                deduplication_ttl: deduplicationTtl,
+                raw_content: {
+                    enabled: rawContentEnabled,
+                    path: rawContentPath || 'logs'
+                }
+            };
+            
+            // 发送到后端API
+            fetchWithAuth('/api/admin/settings/update', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(settings)
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', '系统设置已成功保存', 'success');
+                } else {
+                    showToast('错误', data.message || '保存系统设置失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('保存系统设置出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+            });
+        }
+        
+        // 复制到剪贴板
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text)
+                .then(() => {
+                    // 显示复制成功的提示
+                    const toast = document.createElement('div');
+                    toast.className = 'position-fixed bottom-0 end-0 p-3';
+                    toast.style.zIndex = '5';
+                    toast.innerHTML = `
+                        <div class="toast show align-items-center text-white bg-success border-0" role="alert" aria-live="assertive" aria-atomic="true">
+                            <div class="d-flex">
+                                <div class="toast-body">
+                                    <i class="bi bi-clipboard-check me-2"></i> 已复制到剪贴板
+                                </div>
+                                <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast"></button>
+                            </div>
+                        </div>
+                    `;
+                    document.body.appendChild(toast);
+                    
+                    // 1.5秒后移除提示
+                    setTimeout(() => {
+                        toast.remove();
+                    }, 1500);
+                })
+                .catch(err => {
+                    console.error('复制失败:', err);
+                    
+                    // 如果复制API不可用，使用传统方法
+                    const textarea = document.createElement('textarea');
+                    textarea.value = text;
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textarea);
+                });
+        }
+
+        // 格式化日期时间
+        function formatDate(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleString();
+        }
+
+        // 获取Cookie
+        function getCookie(name) {
+            const value = `; ${document.cookie}`;
+            const parts = value.split(`; ${name}=`);
+            if (parts.length === 2) return parts.pop().split(';').shift();
+            return '';
+        }
+
+        // 加载系统监控数据
+        function loadSystemMonitor() {
+            fetchWithAuth('/api/admin/stats')
+            .then(response => response.json())
+            .then(data => {
+                // 显示Webhook转发配置
+                displayWebhookConfig(data.forward_config, data.webhook_enabled);
+                
+                // 显示连接统计
+                displayConnectionStats(data);
+            })
+            .catch(error => {
+                console.error('加载系统监控数据出错:', error);
+            });
+            
+            // 定时刷新监控数据
+            if (window.monitorTimer) {
+                clearTimeout(window.monitorTimer);
+            }
+            window.monitorTimer = setTimeout(loadSystemMonitor, 10000); // 10秒刷新一次
+        }
+        
+        // 显示Webhook转发配置
+        function displayWebhookConfig(forwardConfig, enabled, tableBodyId = 'webhook-config-body') {
+            const tableBody = document.getElementById(tableBodyId);
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            if (forwardConfig && forwardConfig.length > 0) {
+                forwardConfig.forEach(config => {
+                    const row = document.createElement('tr');
+                    
+                    // 密钥
+                    const secretCell = document.createElement('td');
+                    secretCell.textContent = config.secret;
+                    secretCell.style.fontFamily = 'monospace';
+                    secretCell.style.fontSize = '0.85rem';
+                    row.appendChild(secretCell);
+                    
+                    // 转发URL
+                    const urlCell = document.createElement('td');
+                    urlCell.textContent = config.url;
+                    row.appendChild(urlCell);
+                    
+                    // 状态
+                    const statusCell = document.createElement('td');
+                    const statusBadge = document.createElement('span');
+                    statusBadge.classList.add('badge', enabled ? 'bg-success' : 'bg-danger');
+                    statusBadge.textContent = enabled ? '启用' : '禁用';
+                    statusCell.appendChild(statusBadge);
+                    row.appendChild(statusCell);
+                    
+                    tableBody.appendChild(row);
+                });
+            } else {
+                const row = document.createElement('tr');
+                const noDataCell = document.createElement('td');
+                noDataCell.colSpan = 3;
+                noDataCell.textContent = '未配置Webhook转发';
+                noDataCell.classList.add('text-center', 'py-4');
+                row.appendChild(noDataCell);
+                tableBody.appendChild(row);
+            }
+        }
+        
+        // 显示连接统计
+        function displayConnectionStats(data, tableBodyId = 'connection-stats-body') {
+            const tableBody = document.getElementById(tableBodyId);
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            // 结合密钥和在线状态
+            const stats = {};
+            
+            // 处理per_secret数据
+            if (data.ws && data.wh && data.per_secret) {
+                for (const [secret, secretStats] of Object.entries(data.per_secret)) {
+                    if (!stats[secret]) {
+                        stats[secret] = {
+                            connections: 0,
+                            ws: { success: 0, failure: 0 },
+                            wh: { success: 0, failure: 0 },
+                            webhook_links: 0
+                        };
+                    }
+                    stats[secret].ws = secretStats.ws;
+                    stats[secret].wh = secretStats.wh;
+                }
+            }
+            
+            // 处理在线连接数
+            if (data.online) {
+                for (const [secret, count] of Object.entries(data.online)) {
+                    if (!stats[secret]) {
+                        stats[secret] = {
+                            connections: 0,
+                            ws: { success: 0, failure: 0 },
+                            wh: { success: 0, failure: 0 },
+                            webhook_links: 0
+                        };
+                    }
+                    stats[secret].connections = count;
+                }
+            }
+            
+            // 处理webhook转发配置中的密钥，计算每个密钥配置了多少个webhook链接
+            if (data.forward_config) {
+                // 统计每个密钥配置了多少个webhook链接
+                const webhookLinksCount = {};
+                
+                for (const config of data.forward_config) {
+                    const secret = config.secret;
+                    if (!webhookLinksCount[secret]) {
+                        webhookLinksCount[secret] = 0;
+                    }
+                    webhookLinksCount[secret]++;
+                    
+                    if (!stats[secret]) {
+                        stats[secret] = {
+                            connections: 0,
+                            ws: { success: 0, failure: 0 },
+                            wh: { success: 0, failure: 0 },
+                            webhook_links: 0
+                        };
+                    }
+                }
+                
+                // 更新每个密钥的webhook链接数
+                for (const [secret, count] of Object.entries(webhookLinksCount)) {
+                    if (stats[secret]) {
+                        stats[secret].webhook_links = count;
+                    }
+                }
+            }
+            
+            // 获取黑名单信息
+            let blacklist = [];
+            if (data.blacklist && data.blacklist.secrets) {
+                blacklist = data.blacklist.secrets;
+            }
+            
+            // 转换为数组并排序
+            const statsArray = Object.entries(stats).map(([secret, stat]) => ({
+                secret,
+                ...stat,
+                is_blacklisted: blacklist.includes(secret)
+            }));
+            
+            // 按连接数排序，如果连接数相同，按WebSocket成功次数排序
+            statsArray.sort((a, b) => {
+                if (b.connections !== a.connections) {
+                    return b.connections - a.connections;
+                }
+                return (b.ws.success + b.wh.success) - (a.ws.success + a.wh.success);
+            });
+            
+            // 创建表格
+            if (statsArray.length > 0) {
+                statsArray.forEach(stat => {
+                    const row = document.createElement('tr');
+                    
+                    // 密钥
+                    const secretCell = document.createElement('td');
+                    secretCell.textContent = stat.secret;
+                    secretCell.style.fontFamily = 'monospace';
+                    secretCell.style.fontSize = '0.85rem';
+                    row.appendChild(secretCell);
+                    
+                    // 连接数
+                    const connectionsCell = document.createElement('td');
+                    connectionsCell.textContent = stat.connections;
+                    if (stat.connections > 0) {
+                        connectionsCell.classList.add('text-success', 'fw-bold');
+                    }
+                    row.appendChild(connectionsCell);
+                    
+                    // Webhook推送数
+                    const whLinksCell = document.createElement('td');
+                    whLinksCell.textContent = stat.webhook_links;
+                    if (stat.webhook_links > 0) {
+                        whLinksCell.classList.add('text-primary', 'fw-bold');
+                    }
+                    row.appendChild(whLinksCell);
+                    
+                    // WebSocket成功
+                    const wsSuccessCell = document.createElement('td');
+                    wsSuccessCell.textContent = stat.ws.success;
+                    if (stat.ws.success > 0) {
+                        wsSuccessCell.classList.add('text-success');
+                    }
+                    row.appendChild(wsSuccessCell);
+                    
+                    // WebSocket失败
+                    const wsFailureCell = document.createElement('td');
+                    wsFailureCell.textContent = stat.ws.failure;
+                    if (stat.ws.failure > 0) {
+                        wsFailureCell.classList.add('text-danger');
+                    }
+                    row.appendChild(wsFailureCell);
+                    
+                    // Webhook成功
+                    const whSuccessCell = document.createElement('td');
+                    whSuccessCell.textContent = stat.wh.success;
+                    if (stat.wh.success > 0) {
+                        whSuccessCell.classList.add('text-success');
+                    }
+                    row.appendChild(whSuccessCell);
+                    
+                    // Webhook失败
+                    const whFailureCell = document.createElement('td');
+                    whFailureCell.textContent = stat.wh.failure;
+                    if (stat.wh.failure > 0) {
+                        whFailureCell.classList.add('text-danger');
+                    }
+                    row.appendChild(whFailureCell);
+                    
+                    // 操作按钮
+                    const actionCell = document.createElement('td');
+                    
+                    if (stat.is_blacklisted) {
+                        // 解除拉黑按钮
+                        const unblacklistBtn = document.createElement('button');
+                        unblacklistBtn.classList.add('btn', 'btn-sm', 'btn-success');
+                        unblacklistBtn.innerHTML = '<i class="bi bi-shield-check"></i> 解除拉黑';
+                        unblacklistBtn.title = "解除拉黑该密钥";
+                        unblacklistBtn.addEventListener('click', () => {
+                            removeFromBlacklist(stat.secret);
+                        });
+                        actionCell.appendChild(unblacklistBtn);
+                    } else {
+                        // 拉黑按钮
+                        const blacklistBtn = document.createElement('button');
+                        blacklistBtn.classList.add('btn', 'btn-sm', 'btn-danger');
+                        blacklistBtn.innerHTML = '<i class="bi bi-shield-fill-x"></i> 拉黑';
+                        blacklistBtn.title = "拉黑该密钥，禁止WebSocket连接";
+                        blacklistBtn.addEventListener('click', () => {
+                            addToBlacklist(stat.secret);
+                        });
+                        actionCell.appendChild(blacklistBtn);
+                    }
+                    
+                    row.appendChild(actionCell);
+                    
+                    tableBody.appendChild(row);
+                });
+            } else {
+                const row = document.createElement('tr');
+                const noDataCell = document.createElement('td');
+                noDataCell.colSpan = 8; // 更新跨列数
+                noDataCell.textContent = '暂无连接统计数据';
+                noDataCell.classList.add('text-center');
+                row.appendChild(noDataCell);
+                tableBody.appendChild(row);
+            }
+        }
+        
+        // 添加创建短密钥表单
+        function addShortKeyForm() {
+            const form = document.createElement('form');
+            form.classList.add('mb-4');
+            form.id = 'admin-create-shortkey-form';
+            
+            // 用户名输入
+            const userGroup = document.createElement('div');
+            userGroup.classList.add('mb-3');
+            
+            const userLabel = document.createElement('label');
+            userLabel.textContent = '用户名';
+            userLabel.classList.add('form-label');
+            userGroup.appendChild(userLabel);
+            
+            const userSelect = document.createElement('select');
+            userSelect.classList.add('form-select');
+            userSelect.id = 'shortkey-username';
+            userSelect.required = true;
+            
+            // 添加用户选项
+            const defaultOption = document.createElement('option');
+            defaultOption.value = '';
+            defaultOption.textContent = '请选择用户';
+            userSelect.appendChild(defaultOption);
+            
+            if (allUsers) {
+                allUsers.forEach(user => {
+                    const option = document.createElement('option');
+                    option.value = escapeHTML(user.username);
+                    option.textContent = escapeHTML(user.username);
+                    userSelect.appendChild(option);
+                });
+            }
+            
+            userGroup.appendChild(userSelect);
+            form.appendChild(userGroup);
+            
+            // 密钥输入
+            const secretGroup = document.createElement('div');
+            secretGroup.classList.add('mb-3');
+            
+            const secretLabel = document.createElement('label');
+            secretLabel.textContent = '密钥';
+            secretLabel.classList.add('form-label');
+            secretGroup.appendChild(secretLabel);
+            
+            const secretInput = document.createElement('input');
+            secretInput.type = 'text';
+            secretInput.classList.add('form-control');
+            secretInput.id = 'shortkey-secret';
+            secretInput.required = true;
+            secretInput.placeholder = '请输入密钥';
+            secretInput.setAttribute('maxlength', '64'); // 限制长度
+            secretInput.addEventListener('input', function() {
+                // 只允许字母、数字和特定符号
+                this.value = this.value.replace(/[^\w\-\.]/g, '');
+            });
+            secretGroup.appendChild(secretInput);
+            
+            form.appendChild(secretGroup);
+            
+            // 提交按钮
+            const submitBtn = document.createElement('button');
+            submitBtn.type = 'submit';
+            submitBtn.classList.add('btn', 'btn-primary');
+            submitBtn.textContent = '创建短密钥';
+            form.appendChild(submitBtn);
+            
+            // 提交事件
+            form.addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                const username = document.getElementById('shortkey-username').value;
+                const secret = document.getElementById('shortkey-secret').value;
+                
+                if (!username || !secret) {
+                    alert('用户名和密钥不能为空');
+                    return;
+                }
+                
+                // 验证密钥格式
+                if (!/^[\w\-\.]+$/.test(secret)) {
+                    alert('密钥格式无效，只能包含字母、数字、下划线、横线和点');
+                    return;
+                }
+                
+                // 创建短密钥
+                createShortKey(username, secret);
+            });
+            
+            // 添加到页面
+            document.getElementById('shortkeys-page').insertBefore(form, document.getElementById('shortkeys-page').firstChild);
+        }
+        
+        // XSS防护：HTML转义函数
+        function escapeHTML(str) {
+            if (!str) return '';
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+        
+        // 确保所有API请求都包含认证信息和安全头
+        function fetchWithAuth(url, options = {}) {
+            // 确保options.headers存在
+            if (!options.headers) {
+                options.headers = {};
+            }
+            
+            // 添加管理员认证头
+            if (adminToken) {
+                options.headers['Authorization'] = `Bearer ${adminToken}`;
+            }
+            
+            // 添加安全头
+            options.headers['X-Requested-With'] = 'XMLHttpRequest';
+            
+            // 添加内容安全策略
+            options.headers['Content-Security-Policy'] = "default-src 'self'";
+            
+            // 添加防缓存头，确保始终获取最新数据
+            if (options.method && options.method !== 'GET') {
+                options.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate';
+                options.headers['Pragma'] = 'no-cache';
+            }
+            
+            // 添加请求超时
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒超时
+            options.signal = controller.signal;
+            
+            // 执行请求
+            return fetch(url, options)
+                .then(response => {
+                    clearTimeout(timeoutId); // 清除超时
+                    
+                    // 检查响应状态
+                    if (response.status === 401) {
+                        // 未授权，清除令牌并处理会话过期
+                        handleSessionExpired();
+                        throw new Error('认证失败，请重新登录');
+                    } else if (response.status === 403) {
+                        throw new Error('权限不足，无法执行该操作');
+                    } else if (response.status === 400) {
+                        return response.json().then(data => {
+                            throw new Error(`请求错误: ${data.detail || '输入数据无效'}`);
+                        });
+                    } else if (response.status >= 500) {
+                        throw new Error('服务器错误，请稍后再试');
+                    }
+                    
+                    return response;
+                })
+                .catch(error => {
+                    clearTimeout(timeoutId); // 确保清除超时
+                    
+                    // 特殊处理超时错误
+                    if (error.name === 'AbortError') {
+                        throw new Error('请求超时，请检查网络连接');
+                    }
+                    
+                    throw error;
+                });
+        }
+        
+        // 修改所有API调用，使用fetchWithAuth替代fetch
+        function createShortKey(username, secret) {
+            fetchWithAuth('/api/admin/shortkeys/create', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    username: username,
+                    secret: secret
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.short_key) {
+                    showToast('成功', `短密钥创建成功: ${data.short_key}`, 'success');
+                    
+                    // 清空输入框
+                    document.getElementById('shortkey-secret').value = '';
+                    
+                    loadAllShortkeys();  // 重新加载短密钥列表
+                    loadSystemData();    // 更新系统统计
+                } else {
+                    showToast('错误', data.detail || '创建短密钥失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('创建短密钥出错:', error);
+                showToast('错误', '网络错误，请稍后再试', 'danger');
+            });
+        }
+
+        // 加载邮件配置
+        function loadEmailSettings() {
+            fetchWithAuth('/api/admin/email/settings')
+            .then(response => response.json())
+            .then(data => {
+                // 填充表单
+                document.getElementById('email-enabled').checked = data.enabled || false;
+                document.getElementById('smtp-server').value = data.smtp_server || '';
+                document.getElementById('smtp-port').value = data.smtp_port || '';
+                document.getElementById('use-tls').checked = data.use_tls !== false; // 默认为true
+                document.getElementById('smtp-username').value = data.username || '';
+                document.getElementById('smtp-password').value = data.password || '';
+                document.getElementById('from-name').value = data.from_name || '';
+                document.getElementById('from-email').value = data.from_email || '';
+                document.getElementById('subject-prefix').value = data.subject_prefix || '';
+                
+                // 填充邮件模板
+                document.getElementById('verification-template-editor').value = data.verification_template || '';
+                
+                // 填充注册设置
+                document.getElementById('registration-enabled').checked = data.registration?.enabled !== false; // 默认为true
+                document.getElementById('require-email').checked = data.registration?.require_email !== false; // 默认为true
+                document.getElementById('require-email-verification').checked = data.registration?.require_email_verification !== false; // 默认为true
+                document.getElementById('require-captcha').checked = data.registration?.require_captcha !== false; // 默认为true
+                document.getElementById('max-users').value = data.registration?.max_users || 1000;
+                document.getElementById('verification-code-ttl').value = data.registration?.verification_code_ttl || 1800;
+                document.getElementById('min-password-length').value = data.registration?.min_password_length || 8;
+                document.getElementById('password-strength').value = data.registration?.password_strength || 'medium';
+            })
+            .catch(error => {
+                console.error('加载邮件配置出错:', error);
+            });
+        }
+        
+        // 邮件配置功能已移除
+        
+        // 邮件模板功能已移除
+        
+        // 测试邮件功能已移除
+        
+        // 注册设置功能已移除
+
+        // 用户相关函数已移除
+        
+        // 密钥脱敏处理
+        function maskSecret(secret) {
+            if (!secret || secret.length <= 6) {
+                return '******';
+            }
+            
+            const prefix = secret.substring(0, 3);
+            const suffix = secret.substring(secret.length - 3);
+            const maskLength = Math.min(secret.length - 6, 10);
+            
+            return prefix + '*'.repeat(maskLength) + suffix;
+        }
+
+        // 显示通知消息
+        function showToast(title, message, type = 'info') {
+            // 创建Toast容器（如果不存在）
+            let toastContainer = document.getElementById('toast-container');
+            if (!toastContainer) {
+                toastContainer = document.createElement('div');
+                toastContainer.id = 'toast-container';
+                toastContainer.className = 'position-fixed top-0 end-0 p-3';
+                toastContainer.style.zIndex = '9999';
+                document.body.appendChild(toastContainer);
+            }
+            
+            // 定义Toast样式
+            const typeClasses = {
+                'success': 'text-bg-success',
+                'danger': 'text-bg-danger',
+                'warning': 'text-bg-warning',
+                'info': 'text-bg-info'
+            };
+            
+            const typeIcons = {
+                'success': 'bi-check-circle-fill',
+                'danger': 'bi-exclamation-triangle-fill',
+                'warning': 'bi-exclamation-triangle-fill',
+                'info': 'bi-info-circle-fill'
+            };
+            
+            // 创建Toast元素
+            const toastId = 'toast-' + Date.now();
+            const toast = document.createElement('div');
+            toast.id = toastId;
+            toast.className = `toast align-items-center ${typeClasses[type] || typeClasses.info} border-0`;
+            toast.setAttribute('role', 'alert');
+            toast.setAttribute('aria-live', 'assertive');
+            toast.setAttribute('aria-atomic', 'true');
+            toast.setAttribute('data-bs-autohide', 'true');
+            toast.setAttribute('data-bs-delay', '5000');
+            
+            toast.innerHTML = `
+                <div class="d-flex">
+                    <div class="toast-body">
+                        <i class="bi ${typeIcons[type] || typeIcons.info} me-2"></i>
+                        <strong>${title}</strong><br>
+                        ${message}
+                    </div>
+                    <button type="button" class="btn-close btn-close-white me-2 m-auto" data-bs-dismiss="toast" aria-label="Close"></button>
+                </div>
+            `;
+            
+            // 添加到容器
+            toastContainer.appendChild(toast);
+            
+            // 初始化并显示Toast
+            const bsToast = new bootstrap.Toast(toast);
+            bsToast.show();
+            
+            // 自动移除Toast元素
+            toast.addEventListener('hidden.bs.toast', function() {
+                toastContainer.removeChild(toast);
+            });
+        }
+
+        document.getElementById('refresh-appids-btn')?.addEventListener('click', function(e) {
+            e.preventDefault();
+            loadAllAppIds();
+        });
+
+        // 发送创建AppID的请求
+        function createAppIdRequest(appid, secret, description) {
+            console.log('正在创建AppID:', appid);
+            showToast('处理中', '正在创建AppID...', 'info');
+            
+            // 构建GET请求URL
+            const url = `/api/admin/create_appid?appid=${encodeURIComponent(appid)}&secret=${encodeURIComponent(secret)}&description=${encodeURIComponent(description)}`;
+            
+            // 创建fetch请求
+            fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${adminToken}`
+                }
+            })
+            .then(response => {
+                if (!response.ok) {
+                    return response.json().then(data => {
+                        throw new Error(data.detail || '创建AppID失败');
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                console.log('创建成功:', data);
+                
+                // 清空输入框
+                document.getElementById('create-appid').value = '';
+                document.getElementById('create-secret').value = '';
+                document.getElementById('create-description').value = '';
+                
+                // 显示成功消息
+                showToast('成功', `AppID ${data.appid} 创建成功`, 'success');
+                
+                // 重新加载数据
+                loadAllAppIds();
+                loadSystemData();
+            })
+            .catch(error => {
+                console.error('创建AppID失败:', error);
+                showToast('错误', error.message || '创建AppID失败', 'danger');
+            });
+        }
+
+        // 加载所有AppID
+        function loadAllAppIds() {
+            const xhr = new XMLHttpRequest();
+            xhr.open('GET', '/api/admin/appids', true);
+            xhr.setRequestHeader('Authorization', `Bearer ${adminToken}`);
+            
+            xhr.onload = function() {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    const appids = JSON.parse(xhr.responseText);
+                    allAppIds = appids;
+                    displayAllAppIds();
+                } else {
+                    console.error('加载AppID失败:', xhr.status);
+                    showToast('错误', '加载AppID列表失败', 'danger');
+                }
+            };
+            
+            xhr.onerror = function() {
+                console.error('网络错误');
+                showToast('错误', '网络错误，请检查连接', 'danger');
+            };
+            
+            xhr.send();
+        }
+
+        function displayAllAppIds() {
+            const tableBody = document.getElementById('all-appids-table-body');
+            const noAppIds = document.getElementById('no-all-appids');
+            
+            // 清空表格
+            tableBody.innerHTML = '';
+            
+            if (allAppIds && allAppIds.length > 0) {
+                noAppIds.style.display = 'none';
+                
+                // 按创建时间排序，最新的在前面
+                allAppIds.sort((a, b) => b.create_time - a.create_time);
+                
+                allAppIds.forEach(item => {
+                    const row = document.createElement('tr');
+                    
+                    // AppID列
+                    const appIdCell = document.createElement('td');
+                    appIdCell.textContent = item.appid;
+                    appIdCell.style.fontWeight = 'bold';
+                    row.appendChild(appIdCell);
+                    
+                    // 密钥列
+                    const secretCell = document.createElement('td');
+                    const secretDisplay = document.createElement('div');
+                    secretDisplay.className = 'secret-display';
+                    
+                    const secretMasked = document.createElement('span');
+                    secretMasked.className = 'secret-masked';
+                    secretMasked.textContent = item.secret_masked;
+                    secretDisplay.appendChild(secretMasked);
+                    
+                    const secretFull = document.createElement('span');
+                    secretFull.className = 'secret-full d-none';
+                    secretFull.textContent = item.secret;
+                    secretDisplay.appendChild(secretFull);
+                    
+                    const toggleBtn = document.createElement('button');
+                    toggleBtn.className = 'btn btn-sm btn-outline-secondary ms-2';
+                    toggleBtn.innerHTML = '<i class="bi bi-eye"></i>';
+                    toggleBtn.addEventListener('click', function() {
+                        secretMasked.classList.toggle('d-none');
+                        secretFull.classList.toggle('d-none');
+                        toggleBtn.innerHTML = secretMasked.classList.contains('d-none') ? 
+                            '<i class="bi bi-eye-slash"></i>' : '<i class="bi bi-eye"></i>';
+                    });
+                    
+                    secretDisplay.appendChild(toggleBtn);
+                    secretCell.appendChild(secretDisplay);
+                    row.appendChild(secretCell);
+                    
+                    // 描述列
+                    const descriptionCell = document.createElement('td');
+                    descriptionCell.textContent = item.description || '无';
+                    row.appendChild(descriptionCell);
+                    
+                    // 创建时间列
+                    const createTimeCell = document.createElement('td');
+                    createTimeCell.textContent = formatDate(item.create_time * 1000);
+                    row.appendChild(createTimeCell);
+                    
+                    // WebSocket统计列
+                    const wsCell = document.createElement('td');
+                    wsCell.innerHTML = `
+                        <span class="badge bg-success">成功: ${item.ws?.success || 0}</span>
+                        <span class="badge bg-danger">失败: ${item.ws?.failure || 0}</span>
+                    `;
+                    row.appendChild(wsCell);
+                    
+                    // Webhook统计列
+                    const whCell = document.createElement('td');
+                    whCell.innerHTML = `
+                        <span class="badge bg-success">成功: ${item.wh?.success || 0}</span>
+                        <span class="badge bg-danger">失败: ${item.wh?.failure || 0}</span>
+                    `;
+                    row.appendChild(whCell);
+                    
+                    // 开放平台验证链接
+                    const verifyCell = document.createElement('td');
+                    const verifyLinkDiv = document.createElement('div');
+                    verifyLinkDiv.className = 'input-group';
+                    
+                    // 获取当前域名和协议，用于构建各种URL
+                    const currentProtocol = window.location.protocol;
+                    const currentHost = window.location.host;
+                    
+                    // 构建开放平台验证链接
+                    const verifyUrl = `${currentProtocol}//${currentHost}/api/${item.appid}`;
+                    
+                    const verifyInput = document.createElement('input');
+                    verifyInput.type = 'text';
+                    verifyInput.className = 'form-control form-control-sm';
+                    verifyInput.value = verifyUrl;
+                    verifyInput.readOnly = true;
+                    
+                    const copyVerifyBtn = document.createElement('button');
+                    copyVerifyBtn.className = 'btn btn-sm btn-outline-secondary';
+                    copyVerifyBtn.innerHTML = '<i class="bi bi-clipboard"></i>';
+                    copyVerifyBtn.title = '复制验证链接';
+                    copyVerifyBtn.addEventListener('click', function() {
+                        copyToClipboard(verifyUrl, '已复制验证链接');
+                        this.innerHTML = '<i class="bi bi-check"></i>';
+                        setTimeout(() => {
+                            this.innerHTML = '<i class="bi bi-clipboard"></i>';
+                        }, 1500);
+                    });
+                    
+                    verifyLinkDiv.appendChild(verifyInput);
+                    verifyLinkDiv.appendChild(copyVerifyBtn);
+                    verifyCell.appendChild(verifyLinkDiv);
+                    
+                    row.appendChild(verifyCell);
+                    
+                    // 操作列
+                    const actionCell = document.createElement('td');
+                    
+                    // 复制WebSocket链接按钮
+                    const copyWsBtn = document.createElement('button');
+                    copyWsBtn.className = 'btn btn-sm btn-outline-primary me-1';
+                    copyWsBtn.innerHTML = '<i class="bi bi-lightning"></i>';
+                    copyWsBtn.title = '复制WebSocket链接';
+                    
+                    // 构建WebSocket URL（使用appid而不是原始密钥）
+                    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                    const wsUrl = `${wsProtocol}//${currentHost}/api/ws/${item.appid}`;
+                    
+                    copyWsBtn.addEventListener('click', () => copyToClipboard(wsUrl, '已复制WebSocket链接'));
+                    actionCell.appendChild(copyWsBtn);
+                    
+                    // 设置Webhook转发按钮
+                    const webhookBtn = document.createElement('button');
+                    webhookBtn.className = 'btn btn-sm btn-outline-info me-1';
+                    webhookBtn.innerHTML = '<i class="bi bi-arrow-repeat"></i>';
+                    webhookBtn.title = '设置Webhook转发';
+                    webhookBtn.addEventListener('click', () => setupWebhookForward(item.appid, item.secret));
+                    actionCell.appendChild(webhookBtn);
+                    
+                    // 删除按钮
+                    const deleteBtn = document.createElement('button');
+                    deleteBtn.className = 'btn btn-sm btn-outline-danger';
+                    deleteBtn.innerHTML = '<i class="bi bi-trash"></i>';
+                    deleteBtn.title = '删除AppID';
+                    deleteBtn.addEventListener('click', () => deleteAppId(item.appid));
+                    actionCell.appendChild(deleteBtn);
+                    
+                    row.appendChild(actionCell);
+                    
+                    tableBody.appendChild(row);
+                });
+            } else {
+                noAppIds.style.display = 'block';
+            }
+        }
+
+        function deleteAppId(appId) {
+            if (!confirm(`确定要删除AppID ${appId} 吗？`)) {
+                return;
+            }
+            
+            fetchWithAuth(`/api/admin/appids/${encodeURIComponent(appId)}`, {
+                method: 'DELETE'
+            })
+            .then(response => response.json())
+            .then(data => {
+                showToast('成功', `AppID ${appId} 已成功删除`, 'success');
+                loadAllAppIds();  // 重新加载AppID列表
+                loadSystemData();  // 更新统计信息
+            })
+            .catch(error => {
+                console.error('删除AppID失败:', error);
+                showToast('错误', '删除AppID失败', 'danger');
+            });
+        }
+
+        // 设置Webhook转发
+        function setupWebhookForward(appid, secret) {
+            // 创建模态对话框
+            const modalId = 'webhookModal';
+            let modal = document.getElementById(modalId);
+            
+            // 如果模态框已存在，则移除它
+            if (modal) {
+                modal.remove();
+            }
+            
+            // 创建新的模态框
+            modal = document.createElement('div');
+            modal.id = modalId;
+            modal.className = 'modal fade';
+            modal.tabIndex = '-1';
+            modal.setAttribute('aria-labelledby', 'webhookModalLabel');
+            modal.setAttribute('aria-hidden', 'true');
+            
+            modal.innerHTML = `
+                <div class="modal-dialog">
+                    <div class="modal-content">
+                        <div class="modal-header">
+                            <h5 class="modal-title" id="webhookModalLabel">设置Webhook转发</h5>
+                            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="关闭"></button>
+                        </div>
+                        <div class="modal-body">
+                            <form id="webhook-form">
+                                <div class="mb-3">
+                                    <label for="webhook-url" class="form-label">Webhook URL</label>
+                                    <input type="url" class="form-control" id="webhook-url" placeholder="https://example.com/webhook" required>
+                                    <div class="form-text">输入接收Webhook推送的URL</div>
+                                </div>
+                                <div class="mb-3">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="webhook-enabled" checked>
+                                        <label class="form-check-label" for="webhook-enabled">启用Webhook转发</label>
+                                    </div>
+                                </div>
+                            </form>
+                            <div class="mt-3">
+                                <h6>当前配置的Webhook URLs:</h6>
+                                <ul id="webhook-urls-list" class="list-group mt-2">
+                                    <li class="list-group-item text-center text-muted">加载中...</li>
+                                </ul>
+                            </div>
+                        </div>
+                        <div class="modal-footer">
+                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">关闭</button>
+                            <button type="button" class="btn btn-primary" id="save-webhook">保存</button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            document.body.appendChild(modal);
+            
+            // 初始化Bootstrap模态框
+            const modalInstance = new bootstrap.Modal(modal);
+            modalInstance.show();
+            
+            // 加载现有的Webhook URLs
+            loadWebhookUrls(appid, secret);
+            
+            // 保存按钮点击事件
+            document.getElementById('save-webhook').addEventListener('click', function() {
+                const webhookUrl = document.getElementById('webhook-url').value.trim();
+                const enabled = document.getElementById('webhook-enabled').checked;
+                
+                if (!webhookUrl) {
+                    showToast('错误', 'Webhook URL不能为空', 'danger');
+                    return;
+                }
+                
+                // 保存Webhook配置
+                saveWebhookConfig(appid, secret, webhookUrl, enabled);
+            });
+        }
+        
+        // 加载Webhook URLs
+        function loadWebhookUrls(appid, secret) {
+            fetchWithAuth(`/api/admin/webhook/urls?appid=${encodeURIComponent(appid)}&secret=${encodeURIComponent(secret)}`)
+            .then(response => response.json())
+            .then(data => {
+                const listElement = document.getElementById('webhook-urls-list');
+                listElement.innerHTML = '';
+                
+                if (data.urls && data.urls.length > 0) {
+                    data.urls.forEach(url => {
+                        const li = document.createElement('li');
+                        li.className = 'list-group-item d-flex justify-content-between align-items-center';
+                        
+                        const urlSpan = document.createElement('span');
+                        urlSpan.textContent = url.url;
+                        urlSpan.className = url.enabled ? '' : 'text-muted text-decoration-line-through';
+                        li.appendChild(urlSpan);
+                        
+                        const btnGroup = document.createElement('div');
+                        btnGroup.className = 'btn-group btn-group-sm';
+                        
+                        // 启用/禁用按钮
+                        const toggleBtn = document.createElement('button');
+                        toggleBtn.className = `btn btn-sm btn-outline-${url.enabled ? 'warning' : 'success'}`;
+                        toggleBtn.innerHTML = url.enabled ? '<i class="bi bi-pause-fill"></i>' : '<i class="bi bi-play-fill"></i>';
+                        toggleBtn.title = url.enabled ? '禁用' : '启用';
+                        toggleBtn.addEventListener('click', () => toggleWebhookUrl(appid, secret, url.url, !url.enabled));
+                        btnGroup.appendChild(toggleBtn);
+                        
+                        // 删除按钮
+                        const deleteBtn = document.createElement('button');
+                        deleteBtn.className = 'btn btn-sm btn-outline-danger';
+                        deleteBtn.innerHTML = '<i class="bi bi-trash"></i>';
+                        deleteBtn.title = '删除';
+                        deleteBtn.addEventListener('click', () => deleteWebhookUrl(appid, secret, url.url));
+                        btnGroup.appendChild(deleteBtn);
+                        
+                        li.appendChild(btnGroup);
+                        listElement.appendChild(li);
+                    });
+                } else {
+                    const li = document.createElement('li');
+                    li.className = 'list-group-item text-center text-muted';
+                    li.textContent = '暂无配置的Webhook URLs';
+                    listElement.appendChild(li);
+                }
+            })
+            .catch(error => {
+                console.error('加载Webhook URLs失败:', error);
+                const listElement = document.getElementById('webhook-urls-list');
+                listElement.innerHTML = '<li class="list-group-item text-center text-danger">加载失败</li>';
+            });
+        }
+        
+        // 保存Webhook配置
+        function saveWebhookConfig(appid, secret, webhookUrl, enabled) {
+            fetchWithAuth('/api/admin/webhook/add', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    appid: appid,
+                    secret: secret,
+                    url: webhookUrl,
+                    enabled: enabled
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', 'Webhook配置已保存', 'success');
+                    document.getElementById('webhook-url').value = '';
+                    loadWebhookUrls(appid, secret);  // 重新加载Webhook URLs
+                } else {
+                    showToast('错误', data.message || 'Webhook配置保存失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('保存Webhook配置失败:', error);
+                showToast('错误', '保存Webhook配置失败', 'danger');
+            });
+        }
+        
+        // 切换Webhook URL的启用状态
+        function toggleWebhookUrl(appid, secret, webhookUrl, enabled) {
+            fetchWithAuth('/api/admin/webhook/toggle', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    appid: appid,
+                    secret: secret,
+                    url: webhookUrl,
+                    enabled: enabled
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', `Webhook URL已${enabled ? '启用' : '禁用'}`, 'success');
+                    loadWebhookUrls(appid, secret);  // 重新加载Webhook URLs
+                } else {
+                    showToast('错误', data.message || '操作失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('切换Webhook URL状态失败:', error);
+                showToast('错误', '操作失败', 'danger');
+            });
+        }
+        
+        // 删除Webhook URL
+        function deleteWebhookUrl(appid, secret, webhookUrl) {
+            if (!confirm('确定要删除此Webhook URL吗？')) {
+                return;
+            }
+            
+            fetchWithAuth('/api/admin/webhook/delete', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    appid: appid,
+                    secret: secret,
+                    url: webhookUrl
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    showToast('成功', 'Webhook URL已删除', 'success');
+                    loadWebhookUrls(appid, secret);  // 重新加载Webhook URLs
+                } else {
+                    showToast('错误', data.message || '删除失败', 'danger');
+                }
+            })
+            .catch(error => {
+                console.error('删除Webhook URL失败:', error);
+                showToast('错误', '删除失败', 'danger');
+            });
+        }
+    </script>
+    <!-- 添加Animate.css库 -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css"/>
+    <!-- 添加Bootstrap的JavaScript库 -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html> 
+</html> 
