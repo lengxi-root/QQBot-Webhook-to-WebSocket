@@ -48,6 +48,13 @@ class MessageCacheManager:
 
                 if expired_ids:
                     logging.debug(f"清理过期消息ID: {len(expired_ids)}个")
+                
+                # 防止message_id_cache无限增长：如果超过10000条，强制清理最旧的
+                if len(self.message_id_cache) > 10000:
+                    sorted_ids = sorted(self.message_id_cache.items(), key=lambda x: x[1])
+                    for msg_id, _ in sorted_ids[:len(self.message_id_cache) - 5000]:
+                        self.message_id_cache.pop(msg_id, None)
+                    logging.warning(f"消息ID缓存超限，强制清理至5000条")
 
                 for secret in list(self.message_cache.keys()):
                     try:

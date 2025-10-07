@@ -93,6 +93,26 @@ class StatsManager:
                         pass
                 
                 with self.stats_lock:
+                    # 清理无活动的secret统计（超过1000个时，只保留最近活跃的500个）
+                    if len(self.stats["per_secret"]) > 1000:
+                        # 计算每个secret的总活动数
+                        secret_activity = {}
+                        for secret, data in self.stats["per_secret"].items():
+                            total = (data["ws"]["success"] + data["ws"]["failure"] + 
+                                   data["wh"]["success"] + data["wh"]["failure"])
+                            secret_activity[secret] = total
+                        
+                        # 按活跃度排序，只保留前500个
+                        sorted_secrets = sorted(secret_activity.items(), key=lambda x: x[1], reverse=True)
+                        secrets_to_keep = set(s for s, _ in sorted_secrets[:500])
+                        
+                        # 删除不活跃的secret
+                        secrets_to_remove = [s for s in self.stats["per_secret"].keys() if s not in secrets_to_keep]
+                        for secret in secrets_to_remove:
+                            del self.stats["per_secret"][secret]
+                        
+                        logging.warning(f"清理统计数据：删除{len(secrets_to_remove)}个不活跃的secret统计")
+                    
                     current = {
                         "total_messages": self.stats["total_messages"],
                         "ws": dict(self.stats["ws"]),

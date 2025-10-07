@@ -56,8 +56,94 @@ IP_DATA_FILE = "data/ip_access.json"
 ip_access_data: Dict[str, Dict] = {}
 _last_ip_cleanup = 0
 
+# 内存清理配置
+MEMORY_CLEANUP_INTERVAL = 180  # 3分钟清理一次
+SESSION_MAX_AGE = 60 * 60 * 24 * 1  # session保留7天
+IP_DATA_MAX_AGE = 60 * 60 * 24 * 1  # IP数据保留30天
+
 class Payload(BaseModel):
     d: dict
+
+async def cleanup_memory():
+    """定期清理内存中的过期数据，防止内存泄漏"""
+    while True:
+        try:
+            await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
+            
+            now = datetime.now()
+            cleanup_stats = {
+                "sessions": 0,
+                "ip_data": 0,
+                "push_records": 0,
+                "cache_locks": 0
+            }
+            
+            # 1. 清理过期的session（注意：已经有cleanup_expired_sessions函数在处理基于expires的清理）
+            # 这里额外清理可能的孤立session
+            expired_sessions = []
+            for session_id, session_info in valid_sessions.items():
+                created = session_info.get('created')
+                if created and (now - created).total_seconds() > SESSION_MAX_AGE:
+                    expired_sessions.append(session_id)
+            
+            for session_id in expired_sessions:
+                valid_sessions.pop(session_id, None)
+                cleanup_stats["sessions"] += 1
+            
+            # 3. 清理过期的IP访问数据
+            expired_ips = []
+            for ip, ip_info in ip_access_data.items():
+                try:
+                    last_access = datetime.fromisoformat(ip_info.get('last_access', ''))
+                    if (now - last_access).total_seconds() > IP_DATA_MAX_AGE:
+                        expired_ips.append(ip)
+                except:
+                    pass  # 如果解析失败，保留数据
+            
+            for ip in expired_ips:
+                ip_access_data.pop(ip, None)
+                cleanup_stats["ip_data"] += 1
+            
+            # 4. 清理webhook推送记录（从connections模块）
+            from modules.connections import push_records
+            expired_records = []
+            for msg_id, record in push_records.items():
+                if record.end_time and time.time() - record.end_time > 300:  # 5分钟后清理
+                    expired_records.append(msg_id)
+            
+            for msg_id in expired_records:
+                push_records.pop(msg_id, None)
+                cleanup_stats["push_records"] += 1
+            
+            # 5. 清理未使用的cache_locks
+            # 检查哪些secret已经没有活跃连接和缓存了
+            unused_secrets = []
+            for secret in list(cache_manager.cache_locks.keys()):
+                has_connections = secret in active_connections and len(active_connections[secret]) > 0
+                has_cache = secret in cache_manager.message_cache
+                if not has_connections and not has_cache:
+                    unused_secrets.append(secret)
+            
+            for secret in unused_secrets:
+                cache_manager.cache_locks.pop(secret, None)
+                cleanup_stats["cache_locks"] += 1
+            
+            # 记录清理统计
+            total_cleaned = sum(cleanup_stats.values())
+            if total_cleaned > 0:
+                logging.info(
+                    f"内存清理完成 | "
+                    f"Sessions: {cleanup_stats['sessions']} | "
+                    f"IP数据: {cleanup_stats['ip_data']} | "
+                    f"推送记录: {cleanup_stats['push_records']} | "
+                    f"缓存锁: {cleanup_stats['cache_locks']} | "
+                    f"总计: {total_cleaned}"
+                )
+            else:
+                logging.debug("内存清理完成 | 无过期数据")
+                
+        except Exception as e:
+            logging.error(f"内存清理异常: {str(e)}")
 
 def load_ip_data():
     global ip_access_data
@@ -211,21 +297,25 @@ async def lifespan(app: FastAPI):
     load_ip_data()
     config_task = asyncio.create_task(watch_config())
     health_task = asyncio.create_task(monitor_service_health())
+    cleanup_task = asyncio.create_task(cleanup_memory())  # 启动内存清理任务
     cache_manager.start_cleaning_thread()
     stats_manager.start_write_thread()
 
     logger.info(f"服务已启动 - 监听端口: {config.port}")
+    logger.info(f"内存清理任务已启动 - 清理间隔: {MEMORY_CLEANUP_INTERVAL}秒")
 
     yield
 
     config_task.cancel()
     health_task.cancel()
+    cleanup_task.cancel()  # 停止内存清理任务
     cache_manager.stop_cleaning_thread()
     stats_manager.stop_write_thread()
 
     try:
         await config_task
         await health_task
+        await cleanup_task
     except asyncio.CancelledError:
         pass
     logger.info("服务已停止")
@@ -269,8 +359,8 @@ async def admin_panel(request: Request):
         return RedirectResponse(url=f"/login?token={config.access_token}")
 
 @app.get("/")
-async def root_redirect():
-    return RedirectResponse(url=f"/login?token={config.access_token}")
+async def root():
+    return {"status": "ok", "message": "Webhook"}
 
 @app.get("/login")
 async def unified_login_page(request: Request, token: str = Query(None)):
@@ -509,8 +599,9 @@ async def handle_webhook(
 
     process_time = time.time() - start_time
     if process_time > 2:
+        # 记录处理耗时较长的情况
         logging.warning(f"Webhook处理耗时较长: {process_time:.2f}秒 | 密钥: {PrivacyUtils.sanitize_secret(secret)}")
-
+    
     service_health["last_successful_webhook"] = time.time()
 
     return {"status": "success"}

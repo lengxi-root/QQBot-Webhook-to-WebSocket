@@ -31,8 +31,6 @@ MAX_RETRY_TIME = 180
 SLOW_THRESHOLD = 3
 
 push_records: Dict[str, Dict] = {}
-slow_message_log = deque(maxlen=1000)
-SLOW_MESSAGE_LOG_FILE = "data/slow_messages.jsonl"
 
 json_module = json
 JSONDecodeError = json.JSONDecodeError
@@ -70,44 +68,6 @@ class MessagePushRecord:
 def generate_message_id() -> str:
     return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
 
-
-_file_lock = threading.Lock()
-
-def record_slow_message(record: MessagePushRecord):
-    duration = (record.end_time or time.time()) - record.start_time
-    
-    if duration >= SLOW_THRESHOLD:
-        log_entry = record.to_dict()
-        slow_message_log.append(log_entry)
-        
-        try:
-            os.makedirs(os.path.dirname(SLOW_MESSAGE_LOG_FILE), exist_ok=True)
-            with open(SLOW_MESSAGE_LOG_FILE, 'a', encoding='utf-8') as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
-        except Exception as e:
-            logging.error(f"保存慢消息日志失败: {e}")
-        
-        try:
-            cs_dir = "data/cs"
-            os.makedirs(cs_dir, exist_ok=True)
-            cs_file = os.path.join(cs_dir, f'{datetime.now().strftime("%Y-%m-%d")}.json')
-            
-            cs_entry = {
-                "timestamp": datetime.now().isoformat(),
-                "message_id": record.message_id,
-                "secret": record.secret[:8] + "***",
-                "duration": round(duration, 2),
-                "retry_count": record.retry_count,
-                "status": record.status,
-                "data": record.data.decode('utf-8', errors='ignore')
-            }
-            
-            with _file_lock:
-                with open(cs_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(cs_entry, ensure_ascii=False) + '\n')
-                    
-        except Exception as e:
-            logging.error(f"保存CS消息日志失败: {e}")
 
 async def send_to_all(secret: str, data: bytes):
     try:
@@ -462,7 +422,5 @@ async def forward_webhook(targets: List[dict], body: bytes, headers: dict, timeo
         record.end_time = time.time()
         success_count = sum(1 for r in results if r.get('success') and not r.get('skipped'))
         record.status = "success" if success_count > 0 else "failed"
-        
-        record_slow_message(record)
         
         return results
