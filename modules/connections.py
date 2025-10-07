@@ -1,19 +1,23 @@
 import asyncio
-import aiohttp
+import hashlib
+import json
 import logging
+import os
+import threading
 import time
-from typing import List, Dict, Any
-from fastapi import WebSocket, WebSocketDisconnect
-from datetime import datetime
 from collections import deque
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import aiohttp
+from fastapi import WebSocket, WebSocketDisconnect
+
 from modules.privacy import PrivacyUtils
 from modules.cache import cache_manager
 from modules.stats import stats_manager
 
-# 存储结构
-active_connections = {}  # {secret: {websocket: {"token": str, ...}}}
+active_connections = {}
 
-# 服务健康状态监控
 service_health = {
     "last_successful_webhook": 0,
     "last_successful_ws_message": 0,
@@ -21,25 +25,97 @@ service_health = {
     "high_load_detected": False
 }
 
-# 导入JSON库
-try:
-    import orjson
-    json_module = orjson
-    JSONDecodeError = orjson.JSONDecodeError
-except ImportError:
-    import json
-    json_module = json
-    JSONDecodeError = json.JSONDecodeError
+PUSH_TIMEOUT = 10
+RETRY_INTERVAL = 1
+MAX_RETRY_TIME = 180
+SLOW_THRESHOLD = 3
+
+push_records: Dict[str, Dict] = {}
+slow_message_log = deque(maxlen=1000)
+SLOW_MESSAGE_LOG_FILE = "data/slow_messages.jsonl"
+
+json_module = json
+JSONDecodeError = json.JSONDecodeError
+
+
+class MessagePushRecord:
+    
+    def __init__(self, message_id: str, secret: str, data: bytes, target_count: int):
+        self.message_id = message_id
+        self.secret = secret
+        self.data = data
+        self.target_count = target_count
+        self.start_time = time.time()
+        self.end_time: Optional[float] = None
+        self.retry_count = 0
+        self.success_count = 0
+        self.status = "pending"
+        
+    def to_dict(self) -> Dict[str, Any]:
+        duration = (self.end_time or time.time()) - self.start_time
+        return {
+            "message_id": self.message_id,
+            "secret": self.secret[:8] + "***",
+            "message_preview": self.data[:100].decode('utf-8', errors='ignore'),
+            "target_count": self.target_count,
+            "start_time": datetime.fromtimestamp(self.start_time).isoformat(),
+            "end_time": datetime.fromtimestamp(self.end_time).isoformat() if self.end_time else None,
+            "duration": round(duration, 2),
+            "retry_count": self.retry_count,
+            "success_count": self.success_count,
+            "status": self.status
+        }
+
+
+def generate_message_id() -> str:
+    return hashlib.md5(str(time.time()).encode()).hexdigest()[:16]
+
+
+_file_lock = threading.Lock()
+
+def record_slow_message(record: MessagePushRecord):
+    duration = (record.end_time or time.time()) - record.start_time
+    
+    if duration >= SLOW_THRESHOLD:
+        log_entry = record.to_dict()
+        slow_message_log.append(log_entry)
+        
+        try:
+            os.makedirs(os.path.dirname(SLOW_MESSAGE_LOG_FILE), exist_ok=True)
+            with open(SLOW_MESSAGE_LOG_FILE, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_entry, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logging.error(f"保存慢消息日志失败: {e}")
+        
+        try:
+            cs_dir = "data/cs"
+            os.makedirs(cs_dir, exist_ok=True)
+            cs_file = os.path.join(cs_dir, f'{datetime.now().strftime("%Y-%m-%d")}.json')
+            
+            cs_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "message_id": record.message_id,
+                "secret": record.secret[:8] + "***",
+                "duration": round(duration, 2),
+                "retry_count": record.retry_count,
+                "status": record.status,
+                "data": record.data.decode('utf-8', errors='ignore')
+            }
+            
+            with _file_lock:
+                with open(cs_file, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(cs_entry, ensure_ascii=False) + '\n')
+                    
+        except Exception as e:
+            logging.error(f"保存CS消息日志失败: {e}")
 
 async def send_to_all(secret: str, data: bytes):
-    """向所有相关WebSocket连接发送消息"""
     try:
         lock = await cache_manager.get_lock_for_secret(secret)
         async with lock:
             connections = active_connections.get(secret, {})
             websockets = list(connections.keys())
             
-        # 如果没有WebSocket连接，直接返回，不进行任何操作
         if len(websockets) == 0:
             return False
 
@@ -48,7 +124,6 @@ async def send_to_all(secret: str, data: bytes):
         formal_success = 0
         fail_count = 0
 
-        # 并发发送，提高效率
         tasks = []
         for ws in websockets:
             task = asyncio.create_task(send_to_one(ws, data, connections[ws], secret))
@@ -74,32 +149,27 @@ async def send_to_all(secret: str, data: bytes):
                 else:
                     fail_count += 1
 
-        # 更新WS转发统计
         for _ in range(success_count):
             stats_manager.increment_ws_stats(secret, success=True)
         for _ in range(fail_count):
             stats_manager.increment_ws_stats(secret, success=False)
 
-        # 记录转发结果
         if success_count > 0:
             log_parts = [
-                f"{time.strftime('%m-%d %H:%M:%S')} - WebSocket消息转发成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)}",
+                f"{time.strftime('%m-%d %H:%M:%S')} - WebSocket转发成功 | 密钥：{PrivacyUtils.sanitize_secret(secret)}",
                 f"总数：{success_count}/{len(websockets)}",
                 f"沙盒：{sandbox_success}" if sandbox_success > 0 else "",
                 f"正式：{formal_success}" if formal_success > 0 else ""
             ]
-            # 使用root logger确保消息被处理
             root_logger = logging.getLogger()
             root_logger.info(" | ".join([p for p in log_parts if p]))
 
-            # 只有当有部分失败时才记录部分失败信息，使用info级别而不是warning
             if fail_count > 0:
                 root_logger.info(
                     f"{time.strftime('%m-%d %H:%M:%S')} - 部分消息转发失败 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | "
                     f"失败数：{fail_count}/{len(websockets)}"
                 )
         elif fail_count > 0:
-            # 全部失败时才记录警告日志
             root_logger = logging.getLogger()
             root_logger.warning(
                 f"{time.strftime('%m-%d %H:%M:%S')} - WebSocket消息转发全部失败 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | "
@@ -114,7 +184,6 @@ async def send_to_all(secret: str, data: bytes):
 
 
 async def send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
-    """向单个WebSocket连接发送消息"""
     try:
         is_sandbox = conn_info["is_sandbox"]
         group = conn_info["group"]
@@ -138,18 +207,15 @@ async def send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
         if should_send:
             try:
                 await ws.send_bytes(data)
-                # 使用root logger确保消息被处理，但降级为DEBUG级别
                 root_logger = logging.getLogger()
                 root_logger.debug(f"转发消息内容: {data.decode()}")
 
-                # 更新成功状态
                 lock = await cache_manager.get_lock_for_secret(secret)
                 async with lock:
                     if secret in active_connections and ws in active_connections[secret]:
                         active_connections[secret][ws]["failure_count"] = 0
                         active_connections[secret][ws]["last_activity"] = time.time()
                 
-                # 更新统计
                 stats_manager.increment_ws_stats(secret, success=True)
 
                 return (True, is_sandbox)
@@ -164,25 +230,22 @@ async def send_to_one(ws: WebSocket, data: bytes, conn_info: dict, secret: str):
                             except:
                                 pass
 
-                            # 从连接列表中移除
                             if secret in active_connections and ws in active_connections[secret]:
                                 del active_connections[secret][ws]
                                 if not active_connections[secret]:
                                     del active_connections[secret]
                                 logging.warning(f"连接重试过多关闭 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
                 
-                # 更新统计
                 stats_manager.increment_ws_stats(secret, success=False)
                 
                 return False
-        return None  # 不需要发送
+        return None
     except Exception as e:
         logging.error(f"单个消息发送异常: {e}")
         return False
 
 
 async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cache_type: str, token: str = None):
-    """重发缓存消息"""
     try:
         success = 0
         fail = 0
@@ -190,7 +253,6 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
         now = datetime.now()
         total = len(cache_queue)
 
-        # 生成日志描述
         if cache_type == 'token':
             cache_desc = f"Token：{PrivacyUtils.sanitize_secret(token)}" if token else "Token：未知"
             log_prefix = "Token补发"
@@ -201,7 +263,6 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
         logging.info(
             f"开始补发{cache_desc} | 密钥：{PrivacyUtils.sanitize_secret(secret)} | 总量：{total}")
 
-        # 分批次发送（每秒10条）
         batch_size = 10
         for i in range(0, len(cache_queue), batch_size):
             batch = cache_queue[i:i + batch_size]
@@ -222,13 +283,11 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
             success += batch_success
             fail += batch_fail
 
-            # 记录批次日志
             logging.info(
                 f"{log_prefix}进度 | 密钥：{PrivacyUtils.sanitize_secret(secret)} | "
                 f"批次：{i // batch_size + 1} | 本批：{batch_success}成功/{batch_fail}失败"
             )
 
-            # 严格1秒间隔
             if i + batch_size < len(cache_queue):
                 await asyncio.sleep(1)
 
@@ -245,7 +304,6 @@ async def resend_cache(secret: str, websocket: WebSocket, cache_queue: list, cac
 
 
 async def resend_token_cache(secret: str, token: str, websocket: WebSocket):
-    """补发token缓存消息"""
     try:
         await asyncio.sleep(3)
         messages = await cache_manager.get_messages_for_token(secret, token)
@@ -261,7 +319,6 @@ async def resend_token_cache(secret: str, token: str, websocket: WebSocket):
 
 
 async def resend_public_cache(secret: str, websocket: WebSocket):
-    """补发公共缓存消息"""
     try:
         await asyncio.sleep(3)
         messages = await cache_manager.get_public_messages(secret)
@@ -276,37 +333,31 @@ async def resend_public_cache(secret: str, websocket: WebSocket):
 
 
 async def send_heartbeat(websocket: WebSocket, secret: str):
-    """定期发送心跳包保持连接"""
     try:
         while True:
             try:
-                await asyncio.sleep(25)  # 每25秒发送一次心跳
+                await asyncio.sleep(25)
                 await websocket.send_bytes(json_module.dumps({"op": 11}))
-                # 心跳包日志降级为DEBUG级别，不在前台显示
                 logging.debug(f"发送心跳包 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
             except Exception as e:
                 logging.error(f"心跳发送失败: {e}")
-                # 如果连续3次心跳失败，退出心跳任务
                 break
     except asyncio.CancelledError:
-        # 任务被取消，正常退出
         pass
     except Exception as e:
         logging.error(f"心跳任务异常: {e}")
 
 
 async def handle_ws_message(message: str, websocket: WebSocket):
-    """处理WebSocket消息"""
     try:
         data = json_module.loads(message)
         
-        # 所有WS消息解析降级为DEBUG级别，不在前台显示
         if data.get("op") == 1 and data.get("d") == 1:
             logging.debug(f"解析WS心跳: {data}")
         else:
             logging.debug(f"解析WS消息: {data}")
         
-        if data["op"] == 2:  # 鉴权
+        if data["op"] == 2:
             await websocket.send_bytes(json_module.dumps({
                 "op": 0,
                 "s": 1,
@@ -318,7 +369,7 @@ async def handle_ws_message(message: str, websocket: WebSocket):
                     "shard": [0, 0]
                 }
             }))
-        elif data["op"] == 1:  # 心跳
+        elif data["op"] == 1:
             await websocket.send_bytes(json_module.dumps({"op": 11}))
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
@@ -326,11 +377,20 @@ async def handle_ws_message(message: str, websocket: WebSocket):
 
 
 async def forward_webhook(targets: List[dict], body: bytes, headers: dict, timeout: int, current_secret: str) -> list:
-    """转发Webhook消息到目标URL列表"""
     
-    async def send_to_target(session: aiohttp.ClientSession, target: dict) -> dict:
-        """向单个目标发送消息"""
-        # 只转发给匹配密钥的目标
+    message_id = generate_message_id()
+    webhook_targets = [t for t in targets if t['secret'] == current_secret]
+    
+    record = MessagePushRecord(
+        message_id=message_id,
+        secret=current_secret,
+        data=body,
+        target_count=len(webhook_targets)
+    )
+    record.status = "sending"
+    push_records[message_id] = record
+    
+    async def send_to_target_with_retry(session: aiohttp.ClientSession, target: dict) -> dict:
         if target['secret'] != current_secret:
             return {
                 'url': target['url'],
@@ -340,86 +400,69 @@ async def forward_webhook(targets: List[dict], body: bytes, headers: dict, timeo
                 'reason': '密钥不匹配'
             }
 
-        try:
-            async with session.post(
-                    target['url'],
-                    data=body,
-                    headers=headers,
-                    timeout=timeout
-            ) as response:
-                success = 200 <= response.status < 300
-                result = {
-                    'url': target['url'],
-                    'status': response.status,
-                    'success': success,
-                    'skipped': False,
-                    'retry': False
-                }
-                
-                # 如果请求失败，进行一次重试
-                if not success:
-                    logging.warning(f"Webhook转发失败，3秒后重试: {PrivacyUtils.sanitize_url(target['url'])}")
-                    await asyncio.sleep(3)  # 等待3秒后重试
-                    try:
-                        async with session.post(
-                                target['url'],
-                                data=body,
-                                headers=headers,
-                                timeout=timeout
-                        ) as retry_response:
-                            retry_success = 200 <= retry_response.status < 300
-                            if retry_success:
-                                result = {
-                                    'url': target['url'],
-                                    'status': retry_response.status,
-                                    'success': True,
-                                    'skipped': False,
-                                    'retry': True
-                                }
-                                logging.info(f"Webhook重试转发成功: {PrivacyUtils.sanitize_url(target['url'])}")
-                            else:
-                                result['retry'] = True
-                    except Exception as retry_e:
-                        logging.error(f"Webhook重试转发异常: {str(retry_e)}")
-                        result['retry'] = True
-                        result['retry_error'] = str(retry_e)
-                
-                return result
-        except Exception as e:
-            logging.error(f"Webhook首次转发异常: {str(e)}")
-            # 发生异常，进行重试
-            await asyncio.sleep(3)  # 等待3秒后重试
-            try:
-                async with session.post(
-                        target['url'],
-                        data=body,
-                        headers=headers,
-                        timeout=timeout
-                ) as retry_response:
-                    retry_success = 200 <= retry_response.status < 300
-                    return {
-                        'url': target['url'],
-                        'status': retry_response.status,
-                        'success': retry_success,
-                        'skipped': False,
-                        'error': str(e),
-                        'retry': True
-                    }
-            except Exception as retry_e:
+        start_time = time.time()
+        retry_count = 0
+        last_error = None
+        
+        while True:
+            elapsed = time.time() - start_time
+            
+            if elapsed > MAX_RETRY_TIME:
+                logging.warning(f"Webhook转发超时（{MAX_RETRY_TIME}秒），取消重试 | 密钥: {PrivacyUtils.sanitize_secret(current_secret)}")
                 return {
                     'url': target['url'],
                     'status': None,
                     'success': False,
                     'skipped': False,
-                    'error': str(e),
-                    'retry': True,
-                    'retry_error': str(retry_e)
+                    'timeout': True,
+                    'retry_count': retry_count,
+                    'error': last_error or '超过最大重试时间'
                 }
+            
+            try:
+                async with asyncio.timeout(PUSH_TIMEOUT):
+                    async with session.post(
+                            target['url'],
+                            data=body,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=PUSH_TIMEOUT)
+                    ) as response:
+                        success = 200 <= response.status < 300
+                        
+                        if success:
+                            record.success_count += 1
+                            duration = time.time() - start_time
+                            return {
+                                'url': target['url'],
+                                'status': response.status,
+                                'success': True,
+                                'skipped': False,
+                                'retry_count': retry_count,
+                                'duration': round(duration, 2)
+                            }
+                        else:
+                            last_error = f"HTTP {response.status}"
+                            
+            except asyncio.TimeoutError:
+                last_error = "请求超时（10秒）"
+            except Exception as e:
+                last_error = str(e)
+            
+            retry_count += 1
+            record.retry_count = retry_count
+            await asyncio.sleep(RETRY_INTERVAL)
 
     async with aiohttp.ClientSession() as session:
         tasks = [
-            send_to_target(session, target)
+            send_to_target_with_retry(session, target)
             for target in targets
         ]
         results = await asyncio.gather(*tasks)
-        return results 
+        
+        record.end_time = time.time()
+        success_count = sum(1 for r in results if r.get('success') and not r.get('skipped'))
+        record.status = "success" if success_count > 0 else "failed"
+        
+        record_slow_message(record)
+        
+        return results

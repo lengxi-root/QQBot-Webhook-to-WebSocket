@@ -188,24 +188,22 @@
         <div class="security-info">
             <i class="bi bi-info-circle"></i>
             此页面受到双重安全验证保护<br>
+            密码错误5次将封禁IP 24小时<br>
             会话将在7天后自动过期
         </div>
     </div>
 
     <script>
-        // 登录尝试次数和锁定状态
-        let loginAttempts = {
-            admin: { count: 0, locked: false, lockTime: 0 }
-        };
-        
-        // 错误次数限制
-        const MAX_ADMIN_ATTEMPTS = 3;
-        const LOCK_DURATION = 20 * 60 * 1000; // 20分钟，毫秒
+        // 获取URL中的token参数并保存
+        const urlParams = new URLSearchParams(window.location.search);
+        const accessToken = urlParams.get('token');
+        if (accessToken) {
+            localStorage.setItem('accessToken', accessToken);
+        }
+        const storedAccessToken = localStorage.getItem('accessToken') || '';
         
         // DOM加载完成后执行
         document.addEventListener('DOMContentLoaded', function() {
-            // 检查本地存储中的锁定状态
-            checkLockStatus();
             
             // 自动聚焦到密码输入框
             document.getElementById('admin-password').focus();
@@ -214,12 +212,6 @@
             document.getElementById('admin-login-form').addEventListener('submit', function(e) {
                 e.preventDefault();
                 if (!this.checkValidity()) {
-                    return;
-                }
-                
-                // 检查是否被锁定
-                if (isLocked('admin')) {
-                    showLockError('admin');
                     return;
                 }
                 
@@ -244,64 +236,6 @@
                 }
             });
         });
-        
-        // 检查锁定状态
-        function checkLockStatus() {
-            const adminLockData = localStorage.getItem('adminLoginLocked');
-            if (adminLockData) {
-                const lockInfo = JSON.parse(adminLockData);
-                if (lockInfo.locked && Date.now() < lockInfo.lockTime + LOCK_DURATION) {
-                    loginAttempts.admin.locked = true;
-                    loginAttempts.admin.lockTime = lockInfo.lockTime;
-                    showLockError('admin');
-                } else {
-                    localStorage.removeItem('adminLoginLocked');
-                }
-            }
-        }
-        
-        // 检查是否被锁定
-        function isLocked(type) {
-            if (!loginAttempts[type].locked) {
-                return false;
-            }
-            
-            const now = Date.now();
-            const lockTime = loginAttempts[type].lockTime;
-            
-            if (now >= lockTime + LOCK_DURATION) {
-                loginAttempts[type].locked = false;
-                loginAttempts[type].count = 0;
-                return false;
-            }
-            
-            return true;
-        }
-        
-        // 显示锁定错误
-        function showLockError(type) {
-            const remaining = Math.ceil((loginAttempts[type].lockTime + LOCK_DURATION - Date.now()) / 60000);
-            showError(`登录次数过多，账户已被临时锁定。请在 ${remaining} 分钟后重试。`);
-        }
-        
-        // 记录失败尝试
-        function recordFailedAttempt(type) {
-            loginAttempts[type].count++;
-            
-            const maxAttempts = MAX_ADMIN_ATTEMPTS;
-            
-            if (loginAttempts[type].count >= maxAttempts) {
-                loginAttempts[type].locked = true;
-                loginAttempts[type].lockTime = Date.now();
-                
-                localStorage.setItem(`${type}LoginLocked`, JSON.stringify({
-                    locked: true,
-                    lockTime: loginAttempts[type].lockTime
-                }));
-                
-                showLockError(type);
-            }
-        }
         
         // 显示错误信息
         function showError(message) {
@@ -346,32 +280,28 @@
                 if (response.ok) {
                     const data = await response.json();
                     
-                    if (data.access_token) {
+                    if (data.status === 'success') {
                         // 登录成功
-                        localStorage.setItem('adminToken', data.access_token);
                         localStorage.setItem('adminUsername', 'admin');
                         
-                        // 重置失败计数
-                        loginAttempts.admin.count = 0;
-                        
-                        // 跳转到管理控制台
-                        window.location.href = '/admin';
+                        // 跳转到管理控制台，带上token参数
+                        window.location.href = `/console?token=${storedAccessToken}`;
                     } else {
                         showError('登录失败，请检查密码');
-                        recordFailedAttempt('admin');
                     }
                 } else if (response.status === 401) {
-                    showError('密码错误');
-                    recordFailedAttempt('admin');
+                    const errorData = await response.json();
+                    showError(errorData.detail || '密码错误');
+                } else if (response.status === 403) {
+                    const errorData = await response.json();
+                    showError(errorData.detail || 'IP已被封禁');
                 } else {
                     const errorData = await response.json();
                     showError(errorData.detail || '登录失败，请稍后重试');
-                    recordFailedAttempt('admin');
                 }
             } catch (error) {
                 console.error('登录错误:', error);
                 showError('网络错误，请稍后重试');
-                recordFailedAttempt('admin');
             }
         }
     </script>
