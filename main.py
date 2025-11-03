@@ -505,10 +505,8 @@ async def handle_webhook(
 
     webhook_config = config.webhook_forward
     if webhook_config['enabled'] and webhook_config['targets']:
-        forward_headers = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in ['host', 'content-length']
-        }
+        # 转发全部请求头
+        forward_headers = dict(request.headers)
 
         try:
             forward_results = await forward_webhook(
@@ -579,15 +577,37 @@ async def handle_webhook(
     has_online = secret in active_connections and len(active_connections[secret]) > 0
 
     try:
+        # 构建包含HTTP上下文的消息
+        try:
+            message_data = json_module.loads(body_bytes)
+            # 添加HTTP请求上下文
+            http_context = {
+                'headers': dict(request.headers),
+                'path': request.url.path,
+                'method': request.method,
+                'url': str(request.url),
+                'remote_addr': request.client.host if request.client else 'unknown'
+            }
+            
+            # 将HTTP上下文添加到消息的顶层（不影响原始d字段）
+            if 'http_context' not in message_data:
+                message_data['http_context'] = http_context
+                enhanced_body_bytes = json_module.dumps(message_data, ensure_ascii=False).encode('utf-8')
+            else:
+                enhanced_body_bytes = body_bytes  # 如果已经有http_context，不再添加
+        except:
+            # 如果解析失败，使用原始消息
+            enhanced_body_bytes = body_bytes
+        
         if not has_online and not skip_cache:
-            await cache_manager.add_message(secret, body_bytes)
+            await cache_manager.add_message(secret, enhanced_body_bytes)
             forward_status += " | WS：无在线连接-已缓存"
         elif not has_online:
             forward_status += " | WS：无在线连接-不缓存"
         else:
             forward_status += " | WS：有在线连接"
         try:
-            await send_to_all(secret, body_bytes)
+            await send_to_all(secret, enhanced_body_bytes)
         except Exception as e:
             logging.error(f"实时转发异常: {e}")
             service_health["error_count"] += 1
