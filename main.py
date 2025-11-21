@@ -714,7 +714,7 @@ async def websocket_endpoint(
                     async with lock:
                         if secret in active_connections and websocket in active_connections[secret]:
                             last_activity = active_connections[secret][websocket]["last_activity"]
-                            if time.time() - last_activity > 120:
+                            if time.time() - last_activity > 90:
                                 logging.warning(f"WS连接超时无活动 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
                                 break
                         else:

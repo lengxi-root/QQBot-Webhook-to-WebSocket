@@ -294,16 +294,28 @@ async def resend_public_cache(secret: str, websocket: WebSocket):
 
 async def send_heartbeat(websocket: WebSocket, secret: str):
     try:
+        heartbeat_failures = 0
         while True:
             try:
-                await asyncio.sleep(25)
+                await asyncio.sleep(35)
+                # 发送心跳前检查连接状态
+                if websocket.client_state.name != 'CONNECTED':
+                    logging.warning(f"WebSocket连接已断开，停止心跳 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
+                    break
+                    
                 await websocket.send_bytes(json_module.dumps({"op": 11}))
+                heartbeat_failures = 0  # 重置失败计数
                 logging.debug(f"发送心跳包 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
             except Exception as e:
-                logging.error(f"心跳发送失败: {e}")
-                break
+                heartbeat_failures += 1
+                logging.error(f"心跳发送失败 (第{heartbeat_failures}次): {e}")
+                if heartbeat_failures >= 3:
+                    logging.error(f"心跳连续失败3次，断开连接 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
+                    break
+                # 短暂等待后重试
+                await asyncio.sleep(5)
     except asyncio.CancelledError:
-        pass
+        logging.debug(f"心跳任务被取消 | 密钥：{PrivacyUtils.sanitize_secret(secret)}")
     except Exception as e:
         logging.error(f"心跳任务异常: {e}")
 
@@ -312,12 +324,15 @@ async def handle_ws_message(message: str, websocket: WebSocket):
     try:
         data = json_module.loads(message)
         
-        if data.get("op") == 1 and data.get("d") == 1:
-            logging.debug(f"解析WS心跳: {data}")
-        else:
-            logging.debug(f"解析WS消息: {data}")
+        op_code = data.get("op")
         
-        if data["op"] == 2:
+        if op_code == 1:  # 心跳包
+            logging.debug(f"收到心跳包: {data}")
+            # 立即回应心跳确认
+            await websocket.send_bytes(json_module.dumps({"op": 11}))
+            logging.debug(f"发送心跳确认(op=11)")
+        elif op_code == 2:  # 鉴权
+            logging.debug(f"收到鉴权请求: {data}")
             await websocket.send_bytes(json_module.dumps({
                 "op": 0,
                 "s": 1,
@@ -329,8 +344,17 @@ async def handle_ws_message(message: str, websocket: WebSocket):
                     "shard": [0, 0]
                 }
             }))
-        elif data["op"] == 1:
-            await websocket.send_bytes(json_module.dumps({"op": 11}))
+        elif op_code == 6:  # Resume
+            logging.debug(f"收到重连请求: {data}")
+            await websocket.send_bytes(json_module.dumps({
+                "op": 0,
+                "s": 1,
+                "t": "RESUMED",
+                "d": {}
+            }))
+        else:
+            logging.debug(f"解析WS消息: {data}")
+        
     except Exception as e:
         logging.error(f"WS消息处理错误: {e}")
         service_health["error_count"] += 1
